@@ -170,14 +170,24 @@ impl AccessibilityProvider for LinuxProvider {
         let target = match &query.window_filter {
             Some(filter) => {
                 let needle = filter.to_lowercase();
-                handles
+                let mut matches: Vec<_> = handles
                     .into_iter()
-                    .find(|(w, _, _)| {
+                    .filter(|(w, _, _)| {
                         w.id == *filter
                             || w.title.to_lowercase().contains(&needle)
                             || w.app_name.to_lowercase().contains(&needle)
                     })
-                    .ok_or_else(|| AxdomError::WindowNotFound(filter.clone()))?
+                    .collect();
+                if matches.is_empty() {
+                    return Err(AxdomError::WindowNotFound(filter.clone()));
+                }
+                // Prefer the active window when multiple windows match (e.g. Chromium background frames).
+                if let Some(pos) = matches.iter().position(|(w, _, _)| w.active) {
+                    matches.swap_remove(pos)
+                } else {
+                    // Otherwise prefer the newest (last registered) window over stale index-0 frames.
+                    matches.pop().unwrap()
+                }
             }
             None => handles
                 .into_iter()
@@ -261,7 +271,7 @@ fn walk_node(
     depth: usize,
 ) -> BoxFuture<'static, Option<RawNode>> {
     Box::pin(async move {
-        if dest.is_empty() {
+        if dest.is_empty() || path.as_str() == "/org/a11y/atspi/null" {
             return None;
         }
         let count = ctx.visited.fetch_add(1, Ordering::Relaxed);
