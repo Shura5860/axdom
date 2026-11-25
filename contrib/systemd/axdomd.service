@@ -1,0 +1,15 @@
+[Unit]
+Description=axdom - Zero-latency Desktop Accessibility DOM Daemon
+Documentation=https://github.com/Shura5860/axdom
+PartOf=graphical-session.target
+After=graphical-session.target at-spi-dbus-bus.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/axdom daemon start --enable-a11y
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
