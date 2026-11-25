@@ -1,7 +1,51 @@
+use std::path::{Path, PathBuf};
+
 use axdom_core::{CheckStatus, DoctorCheck, DoctorReport};
 use zbus::Connection;
 
 use crate::proxy::{A11yBusProxy, a11y_status_proxy, accessible_proxy};
+
+const CHROMIUM_FLAG: &str = "--force-renderer-accessibility";
+const FLAG_CONFIG_FILES: &[&str] = &[
+    "brave-flags.conf",
+    "chromium-flags.conf",
+    "chrome-flags.conf",
+    "code-flags.conf",
+    "electron-flags.conf",
+];
+
+/// Idempotently writes `--force-renderer-accessibility` into standard Linux Chromium/Electron
+/// flag files under `$XDG_CONFIG_HOME` (or `$HOME/.config`) so Brave, Chrome, VS Code, and
+/// Electron apps expose their accessibility tree automatically on launch.
+pub fn apply_chromium_a11y_flags() -> std::io::Result<Vec<String>> {
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok_or_else(|| std::io::Error::other("neither XDG_CONFIG_HOME nor HOME is set"))?;
+    apply_chromium_a11y_flags_in(&config_dir)
+}
+
+pub fn apply_chromium_a11y_flags_in(config_dir: &Path) -> std::io::Result<Vec<String>> {
+    std::fs::create_dir_all(config_dir)?;
+    let mut actions = Vec::new();
+    for filename in FLAG_CONFIG_FILES {
+        let path = config_dir.join(filename);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().any(|line| line.trim() == CHROMIUM_FLAG) {
+            actions.push(format!("already set: {}", path.display()));
+            continue;
+        }
+        let mut updated = existing;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(CHROMIUM_FLAG);
+        updated.push('\n');
+        std::fs::write(&path, updated)?;
+        actions.push(format!("updated:     {}", path.display()));
+    }
+    Ok(actions)
+}
 
 pub async fn run_doctor() -> DoctorReport {
     let mut checks = Vec::new();
@@ -55,7 +99,12 @@ pub async fn run_doctor() -> DoctorReport {
     // 3. org.a11y.Status (IsEnabled & ScreenReaderEnabled)
     if let Ok(status_proxy) = a11y_status_proxy(&session).await {
         let is_enabled = status_proxy.is_enabled().await.unwrap_or(false);
-        let sr_enabled = status_proxy.screen_reader_enabled().await.unwrap_or(false);
+        let sr_res = status_proxy.screen_reader_enabled().await;
+        let (sr_label, needs_hint) = match sr_res {
+            Ok(true) => ("true", !is_enabled),
+            Ok(false) => ("false", true),
+            Err(_) => ("unsupported", true),
+        };
 
         checks.push(DoctorCheck {
             name: "a11y-status".to_string(),
@@ -64,9 +113,9 @@ pub async fn run_doctor() -> DoctorReport {
             } else {
                 CheckStatus::Warn
             },
-            detail: format!("IsEnabled={is_enabled}, ScreenReaderEnabled={sr_enabled}"),
-            hint: (!is_enabled || !sr_enabled).then(|| {
-                "Chromium/Electron apps only expose their accessibility tree when ScreenReaderEnabled=true or launched with --force-renderer-accessibility."
+            detail: format!("IsEnabled={is_enabled}, ScreenReaderEnabled={sr_label}"),
+            hint: needs_hint.then(|| {
+                "Chromium/Electron/Brave apps need ScreenReaderEnabled=true or --force-renderer-accessibility. Run `axdom doctor --fix` once to configure flags.conf."
                     .to_string()
             }),
         });
@@ -175,4 +224,27 @@ pub async fn run_doctor() -> DoctorReport {
     }
 
     DoctorReport { checks }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_chromium_flags_idempotently() {
+        let tmp = std::env::temp_dir().join(format!("axdom-flags-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let first = apply_chromium_a11y_flags_in(&tmp).unwrap();
+        assert_eq!(first.len(), FLAG_CONFIG_FILES.len());
+        assert!(first.iter().all(|s| s.starts_with("updated:")));
+
+        let second = apply_chromium_a11y_flags_in(&tmp).unwrap();
+        assert!(second.iter().all(|s| s.starts_with("already set:")));
+
+        let brave = std::fs::read_to_string(tmp.join("brave-flags.conf")).unwrap();
+        assert_eq!(brave.trim(), CHROMIUM_FLAG);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

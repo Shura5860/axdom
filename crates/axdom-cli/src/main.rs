@@ -12,7 +12,7 @@ use axdom_core::{
 use axdom_daemon::{DaemonClient, DaemonState, default_socket_path, serve_unix};
 use axdom_linux::LinuxProvider;
 use axdom_linux::bus::enable_a11y_if_needed;
-use axdom_linux::doctor::run_doctor;
+use axdom_linux::doctor::{apply_chromium_a11y_flags, run_doctor};
 use axdom_linux::events::watch_events;
 use axdom_mcp::{McpServer, serve_stdio};
 use clap::{Parser, Subcommand};
@@ -43,6 +43,10 @@ enum Commands {
         /// Attempt to enable org.a11y.Status IsEnabled & ScreenReaderEnabled on the session bus.
         #[arg(long)]
         enable_a11y: bool,
+
+        /// One-time setup: enable AT-SPI2 and add --force-renderer-accessibility to ~/.config/{brave,chromium,chrome,code,electron}-flags.conf.
+        #[arg(long)]
+        fix: bool,
     },
 
     /// List open desktop windows registered on AT-SPI2.
@@ -243,17 +247,28 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::Doctor { enable_a11y } => {
+        Commands::Doctor { enable_a11y, fix } => {
             let mut enable_warnings = Vec::new();
-            if enable_a11y {
+            let mut fix_actions = Vec::new();
+            if enable_a11y || fix {
                 match enable_a11y_if_needed(true).await {
                     Ok(warns) => enable_warnings = warns,
                     Err(e) => enable_warnings.push(e.to_string()),
                 }
             }
+            if fix {
+                fix_actions = apply_chromium_a11y_flags()?;
+            }
             let report = run_doctor().await;
             if format == OutputFormat::Json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "checks": report.checks,
+                        "fix_actions": fix_actions,
+                        "warnings": enable_warnings,
+                    }))?
+                );
             } else {
                 for check in &report.checks {
                     let badge = match check.status {
@@ -266,8 +281,13 @@ async fn main() -> Result<()> {
                         println!("       hint: {hint}");
                     }
                 }
-                for warn in &enable_warnings {
-                    println!("[WARN] enable-a11y: {warn}");
+                for act in &fix_actions {
+                    println!("[FIX]  {act}");
+                }
+                if !fix {
+                    for warn in &enable_warnings {
+                        println!("[WARN] enable-a11y: {warn}");
+                    }
                 }
             }
             if !report.is_healthy() {

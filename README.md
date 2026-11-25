@@ -79,8 +79,8 @@ Requires Rust (edition 2024) and `at-spi2-core` on Linux.
 cargo build --release -p axdom-cli
 install -Dm755 target/release/axdom ~/.local/bin/axdom
 
-# Verify D-Bus, AT-SPI2 registry, and Wayland/X11 session
-axdom doctor --enable-a11y
+# Verify D-Bus, AT-SPI2 registry, and configure Chromium/Electron/Brave flags once
+axdom doctor --fix
 ```
 
 ### Connect to Claude Desktop, Cursor, or any MCP Client
@@ -174,7 +174,7 @@ The core engine (`axdom-core`, `axdom-mcp`) is already **OS-agnostic** — tree 
 
 ### Known Limitations (v0.1.0)
 
-- **Electron / Chromium apps** often keep accessibility off until `ScreenReaderEnabled=true` or `--force-renderer-accessibility` is passed (`axdom launch <app>` handles this).
+- **Electron / Chromium / Brave apps** often keep accessibility off until `ScreenReaderEnabled=true` or `--force-renderer-accessibility` is passed. Run `axdom doctor --fix` once (configures `~/.config/{brave,chromium,chrome,code,electron}-flags.conf`) or use `axdom launch <app>`.
 - **Canvas, games, and custom-drawn UIs** (e.g., 3D viewports) do not expose accessibility nodes; `axdom` flags a blind-spot warning and can optionally attach a PNG screenshot (`grim`, `gnome-screenshot`, or `scrot`).
 - **Fallback input** (`axdom key`, `--fallback-input`) requires `wtype`/`ydotool` on Wayland or `xdotool` on X11. Standard AT-SPI2 actions need no external tools.
 

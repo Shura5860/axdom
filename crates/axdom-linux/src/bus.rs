@@ -49,21 +49,29 @@ pub async fn enable_a11y_if_needed(enable_screen_reader: bool) -> Result<Vec<Str
     {
         warnings.push(format!("Could not set org.a11y.Status.IsEnabled=true: {e}"));
     }
-    if enable_screen_reader && !status.screen_reader_enabled().await.unwrap_or(false) {
-        match status.set_screen_reader_enabled(true).await {
-            Ok(()) => {
-                // Re-read to verify the desktop compositor actually persisted the flag.
-                if !status.screen_reader_enabled().await.unwrap_or(false) {
-                    warnings.push(
-                        "org.a11y.Status.ScreenReaderEnabled stayed false (common on KDE/Wayland); use `axdom launch <app>` for Chromium/Electron apps."
-                            .to_string(),
-                    );
+    if enable_screen_reader {
+        match status.screen_reader_enabled().await {
+            Ok(true) => {}
+            Ok(false) => match status.set_screen_reader_enabled(true).await {
+                Ok(()) => {
+                    if !status.screen_reader_enabled().await.unwrap_or(false) {
+                        warnings.push(
+                            "org.a11y.Status.ScreenReaderEnabled stayed false; run `axdom doctor --fix` once for Chromium/Electron/Brave apps."
+                                .to_string(),
+                        );
+                    }
                 }
-            }
-            Err(e) => {
-                warnings.push(format!(
-                    "Could not set org.a11y.Status.ScreenReaderEnabled=true: {e}"
-                ));
+                Err(e) => {
+                    warnings.push(format!(
+                        "Could not set org.a11y.Status.ScreenReaderEnabled=true: {e}"
+                    ));
+                }
+            },
+            Err(_) => {
+                warnings.push(
+                    "org.a11y.Status.ScreenReaderEnabled is not exposed by this desktop; run `axdom doctor --fix` once for Chromium/Electron/Brave apps."
+                        .to_string(),
+                );
             }
         }
     }
