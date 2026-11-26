@@ -156,7 +156,6 @@ impl DaemonClient {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -254,7 +253,9 @@ mod tests {
 
     #[tokio::test]
     async fn unix_socket_cache_hit_dirty_invalidation_and_depth_key() {
-        let sock_path = PathBuf::from(format!("/tmp/axdom-test-{}.sock", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("axdom-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sock_path = dir.join("axdom.sock");
         let state = Arc::new(DaemonState::new(
             Arc::new(MockProvider),
             AppPolicy::default(),
@@ -314,6 +315,62 @@ mod tests {
         assert_eq!(st.invalidations, 1);
 
         handle.abort();
-        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serve_unix_enforces_0600_and_rejects_symlink_and_live_collision() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = std::env::temp_dir().join(format!("axdom-sec-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let provider = Arc::new(MockProvider);
+        let state = Arc::new(DaemonState::new(provider, AppPolicy::default()));
+
+        // 1. Symlink at socket path must be rejected with PermissionDenied.
+        let sym_sock = dir.join("sym.sock");
+        let target = dir.join("real.txt");
+        std::fs::write(&target, b"x").unwrap();
+        symlink(&target, &sym_sock).unwrap();
+        let sym_err = serve_unix(&sym_sock, Arc::clone(&state)).await.unwrap_err();
+        assert_eq!(sym_err.kind(), io::ErrorKind::PermissionDenied);
+
+        // 2. Normal bind must enforce 0600 permissions on socket and 0700 on directory.
+        let live_sock = dir.join("live.sock");
+        let sock_clone = live_sock.clone();
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            let _ = serve_unix(&sock_clone, state_clone).await;
+        });
+        for _ in 0..40 {
+            if live_sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let sock_mode = std::fs::symlink_metadata(&live_sock)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(sock_mode, 0o600);
+        let dir_mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        // 3. Second daemon binding to the live socket must fail with AddrInUse without deleting it.
+        let dup_err = serve_unix(&live_sock, Arc::clone(&state))
+            .await
+            .unwrap_err();
+        assert_eq!(dup_err.kind(), io::ErrorKind::AddrInUse);
+        assert!(live_sock.exists());
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

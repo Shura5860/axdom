@@ -105,14 +105,14 @@ pub async fn run_setup(mode: SetupMode) -> std::io::Result<Vec<String>> {
                         }
                     }
                     SetupMode::Undo => {
-                        let status = tokio::process::Command::new("flatpak")
-                            .args(["override", "--user", "--no-talk-name=org.a11y.Bus", app_id])
-                            .output()
-                            .await;
-                        if let Ok(out) = status
-                            && out.status.success()
-                        {
-                            report.push(format!("removed flatpak override: {app_id}"));
+                        let override_file = PathBuf::from(&home)
+                            .join(".local")
+                            .join("share")
+                            .join("flatpak")
+                            .join("overrides")
+                            .join(app_id);
+                        if let Some(msg) = remove_flatpak_a11y_override(&override_file)? {
+                            report.push(msg);
                         }
                     }
                 }
@@ -161,6 +161,11 @@ pub fn ensure_environment_d_file(path: &Path) -> std::io::Result<String> {
 fn handle_environment_d_file(path: &Path, mode: SetupMode) -> std::io::Result<String> {
     match mode {
         SetupMode::Undo => {
+            let bak = backup_path_for(path);
+            if bak.is_file() {
+                std::fs::rename(&bak, path)?;
+                return Ok(format!("restored:    {}", path.display()));
+            }
             if path.is_file() {
                 std::fs::remove_file(path)?;
                 return Ok(format!("removed:     {}", path.display()));
@@ -196,6 +201,30 @@ GTK_MODULES=gail:atk-bridge
     backup_file_once(path)?;
     std::fs::write(path, desired)?;
     Ok(format!("updated:     {}", path.display()))
+}
+
+fn remove_flatpak_a11y_override(override_file: &Path) -> std::io::Result<Option<String>> {
+    if !override_file.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(override_file)?;
+    if !content.contains("org.a11y.Bus=talk") {
+        return Ok(None);
+    }
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|l| l.trim() != "org.a11y.Bus=talk")
+        .collect();
+    // If only empty lines or an empty [Session Bus Policy] header remain, remove the file.
+    let has_other_rules = kept
+        .iter()
+        .any(|l| !l.trim().is_empty() && l.trim() != "[Session Bus Policy]");
+    if !has_other_rules {
+        std::fs::remove_file(override_file)?;
+        return Ok(Some(format!("removed:     {}", override_file.display())));
+    }
+    std::fs::write(override_file, format!("{}\n", kept.join("\n")))?;
+    Ok(Some(format!("reverted:    {}", override_file.display())))
 }
 
 fn undo_flags_in_dir(dir: &Path) -> std::io::Result<Vec<String>> {
@@ -391,6 +420,50 @@ mod tests {
                 .starts_with("would write:")
         );
         assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn undo_restores_existing_envd_backup_and_cleans_flatpak_override() {
+        let tmp = std::env::temp_dir().join(format!("axdom-undo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Pre-existing user file should be backed up and restored on undo.
+        let env_file = tmp.join("axdom.conf");
+        std::fs::write(&env_file, "CUSTOM_VAR=42\n").unwrap();
+        assert!(
+            ensure_environment_d_file(&env_file)
+                .unwrap()
+                .starts_with("updated:")
+        );
+        assert!(
+            handle_environment_d_file(&env_file, SetupMode::Undo)
+                .unwrap()
+                .starts_with("restored:")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env_file).unwrap(),
+            "CUSTOM_VAR=42\n"
+        );
+
+        // Flatpak override file with only org.a11y.Bus=talk should be removed cleanly.
+        let ov_file = tmp.join("com.brave.Browser");
+        std::fs::write(&ov_file, "[Session Bus Policy]\norg.a11y.Bus=talk\n").unwrap();
+        assert!(remove_flatpak_a11y_override(&ov_file).unwrap().is_some());
+        assert!(!ov_file.exists());
+
+        // Flatpak override with other user rules should keep them untouched.
+        std::fs::write(
+            &ov_file,
+            "[Session Bus Policy]\norg.a11y.Bus=talk\norg.freedesktop.Notifications=talk\n",
+        )
+        .unwrap();
+        assert!(remove_flatpak_a11y_override(&ov_file).unwrap().is_some());
+        let remaining = std::fs::read_to_string(&ov_file).unwrap();
+        assert!(!remaining.contains("org.a11y.Bus=talk"));
+        assert!(remaining.contains("org.freedesktop.Notifications=talk"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

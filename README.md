@@ -72,22 +72,32 @@ Over **MCP**, `click_node` and `type_text` automatically wait briefly for UI set
 
 ---
 
-## Install & Run
+## Install in 10 Seconds
 
-Requires Rust (edition 2024) and `at-spi2-core` on Linux.
+**One-line install (Linux & macOS):** downloads the latest release binary and runs `axdom init` to auto-configure detected MCP clients (Claude Desktop, Cursor, Windsurf, Antigravity, Claude Code):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Shura5860/axdom/main/install.sh | sh
+```
+
+**Or build from source** (requires Rust `1.85+`, edition 2024; `at-spi2-core` on Linux):
 
 ```bash
 cargo build --release -p axdom-cli
 install -Dm755 target/release/axdom ~/.local/bin/axdom
-
-# One-time setup: environment.d, Chromium/Electron/Flatpak flags, and .desktop overrides
-axdom setup
+axdom init          # auto-registers MCP clients + runs OS setup (supports --dry-run / --undo)
 axdom doctor
 ```
 
-### Connect to Claude Desktop, Cursor, or any MCP Client
+### Zero-Friction Auto-Hybrid Mode
 
-`axdom mcp` speaks JSON-RPC 2.0 over stdio (`2024-11-05`) and logs strictly to `stderr`.
+You never have to guess whether an app supports accessibility:
+- **DOM-capable apps** (native GTK/Qt, terminals, browsers/Electron with a11y): returns a ~100–300 token pruned DOM in milliseconds with a live token-savings summary.
+- **Blind-spot apps** (games, 3D viewports, Figma canvas, unflagged Electron): `get_desktop_tree` **automatically** attaches a window-cropped PNG overlaid with a 4×4 **Set-of-Mark (`A1..D4`)** coordinate grid so the agent can act immediately via `click_coords`.
+
+### Manual MCP Configuration (optional)
+
+If you prefer manual config instead of `axdom init`, `axdom mcp` speaks JSON-RPC 2.0 over stdio (`2024-11-05`) and logs strictly to `stderr`:
 
 ```json
 {
@@ -100,8 +110,8 @@ axdom doctor
 }
 ```
 
-**Exposed MCP tools (14):**
-- **Inspect:** `list_windows`, `get_desktop_tree`
+**Exposed MCP tools (15):**
+- **Inspect & Launch:** `list_windows`, `get_desktop_tree`, `launch_app` (auto-injects a11y flags + Flatpak fallback, enforces `AppPolicy`)
 - **Semantic actions:** `click_node`, `type_text` (`submit: true` supported), `set_value`, `focus_node`, `scroll_node` (`delta_x` & `delta_y`), `press_key`
 - **Pointer & canvas actions:** `right_click_node`, `double_click_node`, `hover_node`, `drag_node` (`to_node_id` or `to_x`/`to_y`), `click_coords`
 - **Visual / blind-spot fallback:** `capture_screenshot` (cropped to the active window or `node_id` by default for privacy & token savings; `som_grid: true` overlays a 4×4 `A1..D4` Set-of-Mark coordinate grid)
@@ -165,6 +175,17 @@ Every command supports `--json` and `--direct`.
 
 ---
 
+## Benchmarks (Measured on KDE Plasma 6 / Wayland)
+
+| Workload | Build | Raw Nodes → Interactive | Latency | Compact Size |
+|---|---|---|---|---|
+| **Synthetic noisy tree** (`axdom bench --synthetic --runs 10`) | Release | `4,201 → 200` | **1.18 ms** avg (`1.08 ms` min) | `1.41 MB → 6.7 KB` (**209× smaller**) |
+| **KDE Plasma Shell** (`plasmashell`, live AT-SPI2, 5 runs) | Release | `113 → 1` | **13.67 ms** avg (`11.81 ms` min) | `1,624 B` (~406 tok) |
+| **Konsole** (Flatpak `org.kde.konsole`, live AT-SPI2, 5 runs) | Release | `33 → 8` | **7.20 ms** avg (`6.62 ms` min) / **~4 ms** warm daemon | `417 B` (~104 tok) |
+| **Unflagged Brave** (blind-spot detection, live AT-SPI2) | Release | `1 → 0` (auto-hybrid SoM) | **2.93 ms** avg | `373 B` + cropped SoM PNG |
+
+---
+
 ## Security & Guardrails
 
 - **Automatic secret redaction:** `PasswordInput` nodes and input fields with sensitive labels (`password`, `parola`, `cvv`, `api key`, `secret key`, `access token`, etc.) are replaced with `[REDACTED]` in `axdom-core` before serialization. *(Note: apps that misreport both role and label cannot be guaranteed 100% masked — use `--allow-app` for strict scoping.)*
@@ -204,7 +225,7 @@ The core engine (`axdom-core`, `axdom-mcp`) is already **OS-agnostic** — tree 
 - `crates/axdom-windows` — native Windows UI Automation (`IUIAutomation`), Win32 `SendInput`, GDI screenshot, focus event watcher
 - `crates/axdom-macos` — native macOS `AXUIElement`, `CGWindowListCopyWindowInfo`, `CGEvent`, `screencapture` (zero extra FFI crates)
 - `crates/axdom-daemon` — hot-cache local daemon (Unix domain socket on Linux/macOS, Named Pipe on Windows) with live event invalidation
-- `crates/axdom-mcp` — stdio JSON-RPC 2.0 MCP server (14 tools)
+- `crates/axdom-mcp` — stdio JSON-RPC 2.0 MCP server (15 tools)
 - `crates/axdom-cli` — single cross-platform `axdom` binary
 
 ## License
@@ -231,11 +252,19 @@ Klasik masaüstü ajanları her adımda tam ekran PNG alıp vision modeline yoll
 
 ### Hızlı Kurulum ve Kullanım
 
+**Tek satırda kurulum (Linux & macOS):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Shura5860/axdom/main/install.sh | sh
+```
+
+**Veya kaynaktan derleyerek:**
+
 ```bash
 cargo build --release -p axdom-cli
 install -Dm755 target/release/axdom ~/.local/bin/axdom
 
-axdom setup                  # Tek seferlik Linux kurulumu (environment.d, Chromium/Flatpak bayrakları, .desktop)
+axdom init                   # Kurulu MCP istemcilerini (Claude/Cursor/Antigravity) otomatik bağla + Linux setup (--dry-run / --undo)
 axdom doctor                 # Oturum, D-Bus ve erişilebilirlik kontrolü
 axdom windows                # Açık pencereleri listele
 axdom tree                   # Aktif pencerenin budanmış DOM ağacı
@@ -245,6 +274,8 @@ axdom scroll 790 5           # Dikey / yatay (--delta-x) kaydırma
 axdom right-click 790        # Sağ tık (hover, double-click, drag de desteklenir)
 axdom daemon start --enable-a11y  # ~4 ms sıcak önbellekli yerel daemon
 ```
+
+**Otomatik Hibrit Mod:** DOM veren uygulamalarda milisaniyeler içinde kompakt DOM döner; DOM vermeyen (oyun/canvas/flag'siz Electron) uygulamalarda `get_desktop_tree` otomatik olarak aktif pencereye kırpılmış ve 4×4 `A1..D4` Set-of-Mark ızgaralı ekran görüntüsüne düşer.
 
 ### Güvenlik ve Koruma Katmanları
 

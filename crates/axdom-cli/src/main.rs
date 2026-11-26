@@ -1,3 +1,5 @@
+mod init;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,6 +77,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Zero-config onboarding: auto-register axdom in detected MCP clients (Claude, Cursor, Windsurf, Antigravity) and run OS setup.
+    Init {
+        /// Preview changes without modifying any files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove axdom from MCP configs and revert OS setup changes.
+        #[arg(long)]
+        undo: bool,
+    },
+
     /// One-time Linux setup: configure environment.d, Chromium/Electron/Flatpak flags, and .desktop overrides.
     Setup {
         /// Preview changes without modifying any files or Flatpak overrides.
@@ -347,6 +360,44 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
+        Commands::Init { dry_run, undo } => {
+            let init_mode = if undo {
+                init::InitMode::Undo
+            } else if dry_run {
+                init::InitMode::DryRun
+            } else {
+                init::InitMode::Apply
+            };
+            let exe_path = std::env::current_exe()?;
+            let mut actions = init::configure_mcp_clients(&exe_path, init_mode)?;
+
+            #[cfg(target_os = "linux")]
+            {
+                let setup_mode = if undo {
+                    SetupMode::Undo
+                } else if dry_run {
+                    SetupMode::DryRun
+                } else {
+                    let _ = enable_a11y_if_needed(true).await;
+                    SetupMode::Apply
+                };
+                actions.extend(run_setup(setup_mode).await?);
+            }
+
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&actions)?);
+            } else {
+                for act in &actions {
+                    println!("[INIT] {act}");
+                }
+                if !dry_run && !undo {
+                    println!(
+                        "Ready. Restart your MCP client (Claude/Cursor/Antigravity) to start using axdom."
+                    );
+                }
+            }
+        }
+
         Commands::Setup { dry_run, undo } => {
             #[cfg(target_os = "linux")]
             let actions = {

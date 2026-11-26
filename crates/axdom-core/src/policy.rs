@@ -14,9 +14,9 @@ pub const DEFAULT_DENY_APPS: &[&str] = &[
     "kwallet",
     "gpg-agent",
     "pinentry",
-    "signal",
+    "signal-desktop",
     "org.signal.signal",
-    "telegram",
+    "telegram-desktop",
     "org.telegram.desktop",
     "incognito",
     "inprivate",
@@ -107,6 +107,13 @@ mod tests {
                 .is_err()
         );
         assert!(policy.check_read(&win("firefox", "Rust Docs")).is_ok());
+        assert!(policy.check_read(&win("nvim", "signal.rs — nvim")).is_ok());
+        assert!(policy.check_read(&win("signal-desktop", "Signal")).is_err());
+        assert!(
+            policy
+                .check_read(&win("org.signal.signal", "Messages"))
+                .is_err()
+        );
     }
 
     #[test]

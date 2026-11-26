@@ -484,4 +484,34 @@ mod tests {
 
         assert_eq!(before.elements[0].id, after.elements[1].id);
     }
+
+    #[test]
+    fn redacts_input_fields_with_sensitive_labels() {
+        let cvv = raw_node(NodeRole::Input, "Card CVV", Some("914"), vec![]);
+        let parola = raw_node(NodeRole::Input, "Parola", Some("gizli123"), vec![]);
+        let token = raw_node(NodeRole::Input, "API Key", Some("sk-live-1234"), vec![]);
+        let normal = raw_node(NodeRole::Input, "Search", Some("rust"), vec![]);
+        let root = raw_node(
+            NodeRole::Window,
+            "Checkout",
+            None,
+            vec![cvv, parola, token, normal],
+        );
+        let snap = Pruner::new(PrunerConfig::default()).prune(RawWindowTree {
+            window: WindowInfo {
+                id: "w".into(),
+                title: "Checkout".into(),
+                app_name: "brave".into(),
+                pid: Some(1),
+                active: true,
+            },
+            root,
+            total_raw_nodes: 5,
+            truncated: false,
+        });
+        assert_eq!(snap.elements[0].value.as_deref(), Some("[REDACTED]"));
+        assert_eq!(snap.elements[1].value.as_deref(), Some("[REDACTED]"));
+        assert_eq!(snap.elements[2].value.as_deref(), Some("[REDACTED]"));
+        assert_eq!(snap.elements[3].value.as_deref(), Some("rust"));
+    }
 }

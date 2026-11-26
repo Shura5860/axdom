@@ -615,12 +615,16 @@ async fn open_portal_session() -> Result<PortalSession> {
     let session_handle = OwnedObjectPath::try_from(session_str.as_str())
         .map_err(|e| AxdomError::Backend(format!("invalid session_handle '{session_str}': {e}")))?;
 
-    // 2. SelectDevices (keyboard + pointer for scroll, persist_mode=2 to remember permission)
+    // 2. SelectDevices (keyboard + pointer, persist_mode=2 + saved restore_token to avoid re-prompting)
+    let saved_token = load_restore_token();
     let sel_token = next_token("select");
     let mut sel_opts: HashMap<&str, Value<'_>> = HashMap::new();
     sel_opts.insert("handle_token", Value::from(sel_token.as_str()));
     sel_opts.insert("types", Value::from(DEVICE_KEYBOARD | DEVICE_POINTER));
     sel_opts.insert("persist_mode", Value::from(2u32));
+    if let Some(ref tok) = saved_token {
+        sel_opts.insert("restore_token", Value::from(tok.as_str()));
+    }
 
     let sel_req = proxy
         .select_devices(session_handle.as_ref(), sel_opts)
@@ -628,7 +632,7 @@ async fn open_portal_session() -> Result<PortalSession> {
         .map_err(|e| AxdomError::ActionFailed(format!("RemoteDesktop.SelectDevices: {e}")))?;
     wait_for_portal_response(&mut stream, &sel_req, "RemoteDesktop").await?;
 
-    // 3. Start (may prompt the user once on KDE/GNOME)
+    // 3. Start (prompts once when no valid restore_token exists; saves the returned token for future runs)
     let start_token = next_token("start");
     let mut start_opts: HashMap<&str, Value<'_>> = HashMap::new();
     start_opts.insert("handle_token", Value::from(start_token.as_str()));
@@ -637,12 +641,47 @@ async fn open_portal_session() -> Result<PortalSession> {
         .start(session_handle.as_ref(), "", start_opts)
         .await
         .map_err(|e| AxdomError::ActionFailed(format!("RemoteDesktop.Start: {e}")))?;
-    wait_for_portal_response(&mut stream, &start_req, "RemoteDesktop").await?;
+    let start_results = wait_for_portal_response(&mut stream, &start_req, "RemoteDesktop").await?;
+    if let Some(new_token) = start_results
+        .get("restore_token")
+        .and_then(|v| v.downcast_ref::<String>().ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        save_restore_token(&new_token);
+    }
 
     Ok(PortalSession {
         conn,
         session_handle,
     })
+}
+
+fn portal_token_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("axdom").join("portal-token"))
+}
+
+fn load_restore_token() -> Option<String> {
+    let path = portal_token_path()?;
+    let tok = std::fs::read_to_string(path).ok()?;
+    let trimmed = tok.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn save_restore_token(token: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = portal_token_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    if std::fs::write(&path, format!("{}\n", token.trim())).is_ok() {
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 async fn wait_for_portal_response(

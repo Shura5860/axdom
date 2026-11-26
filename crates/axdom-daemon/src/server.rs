@@ -357,7 +357,28 @@ pub async fn serve_unix<P: AccessibilityProvider + 'static>(
 
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        let parent_meta = std::fs::symlink_metadata(parent)?;
+        if parent_meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to use symlink socket directory {}",
+                    parent.display()
+                ),
+            ));
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        let checked_mode = std::fs::symlink_metadata(parent)?.mode() & 0o777;
+        if checked_mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "socket directory {} has unsafe permissions {:o} (expected 0700)",
+                    parent.display(),
+                    checked_mode
+                ),
+            ));
+        }
     }
 
     if let Ok(meta) = std::fs::symlink_metadata(socket_path) {

@@ -94,6 +94,7 @@ impl<P: AccessibilityProvider> McpServer<P> {
         let payload = match name {
             "list_windows" => wrap_text(self.tool_list_windows().await),
             "get_desktop_tree" => self.tool_get_desktop_tree(&args).await,
+            "launch_app" => wrap_text(self.tool_launch_app(&args).await),
             "click_node" => wrap_text(self.tool_click_node(&args).await),
             "right_click_node" => wrap_text(self.tool_right_click_node(&args).await),
             "double_click_node" => wrap_text(self.tool_double_click_node(&args).await),
@@ -153,18 +154,22 @@ impl<P: AccessibilityProvider> McpServer<P> {
                 .unwrap_or(2000),
         };
         let root_scope = args.get("root").and_then(Value::as_str);
+        // Auto-hybrid mode: automatically attach a cropped Set-of-Mark screenshot on blind spots
+        // so agents never hit a dead end on canvas/game/unflagged-Electron windows.
         let fallback_image = args
             .get("include_screenshot_on_blind_spot")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(true);
 
+        let t0 = std::time::Instant::now();
         let (snapshot, root_bounds) = if let Some(mut daemon) = self.try_daemon().await {
             match daemon.get_tree(&query, false).await {
                 Ok((snap, _, _)) => {
                     if let Err(e) = self.policy.check_read(&snap.window) {
                         return tool_text_result(e.to_string(), true);
                     }
-                    (snap, None)
+                    let b = bounding_box_of_elements(&snap.elements);
+                    (snap, b)
                 }
                 Err(e) => return tool_text_result(e.to_string(), true),
             }
@@ -179,6 +184,7 @@ impl<P: AccessibilityProvider> McpServer<P> {
             let bounds = raw.root.bounds;
             (self.pruner.prune(raw), bounds)
         };
+        let elapsed_ms = t0.elapsed().as_millis();
 
         let blind_spot = snapshot.blind_spot;
         *self.last_snapshot.lock().await = Some(snapshot.clone());
@@ -191,16 +197,122 @@ impl<P: AccessibilityProvider> McpServer<P> {
             None => snapshot,
         };
 
-        let text = format_snapshot(&display_snapshot, OutputFormat::Compact);
+        let mut text = format_snapshot(&display_snapshot, OutputFormat::Compact);
+        let est_tokens = (text.len() / 4).max(1);
+        let savings = 2000usize / est_tokens;
+        let _ = write!(
+            text,
+            "\n# axdom: {elapsed_ms}ms | ~{est_tokens} tok (~{savings}x smaller than a 1080p screenshot)"
+        );
 
         if blind_spot
             && fallback_image
             && let Ok(shot) = self.provider.capture_screenshot(root_bounds).await
         {
+            let origin_x = root_bounds.map(|b| b.x).unwrap_or(0);
+            let origin_y = root_bounds.map(|b| b.y).unwrap_or(0);
+            if let Ok(raw_png) = axdom_core::decode_base64(&shot.base64_data)
+                && let Ok((annotated, cells)) =
+                    axdom_core::annotate_som_grid(&raw_png, origin_x, origin_y, 4, 4)
+            {
+                let grid_map: Vec<String> = cells
+                    .iter()
+                    .map(|c| format!("{}=({},{})", c.label, c.center_x, c.center_y))
+                    .collect();
+                let _ = write!(
+                    text,
+                    "\n# auto-hybrid SoM grid (use click_coords): {}",
+                    grid_map.join(" ")
+                );
+                let b64 = axdom_core::encode_base64(&annotated);
+                return tool_text_and_image_result(text, &shot.mime_type, &b64);
+            }
             return tool_text_and_image_result(text, &shot.mime_type, &shot.base64_data);
         }
 
         tool_text_result(text, false)
+    }
+
+    async fn tool_launch_app(&self, args: &Value) -> Result<String, String> {
+        let app = require_str(args, "app")?.trim();
+        if app.is_empty() {
+            return Err("argument 'app' cannot be empty".to_string());
+        }
+
+        let probe_win = axdom_core::WindowInfo {
+            id: "launch".into(),
+            title: app.to_string(),
+            app_name: app.to_string(),
+            pid: None,
+            active: false,
+        };
+        self.policy
+            .check_write(&probe_win)
+            .map_err(|e| e.to_string())?;
+
+        let mut launch_args: Vec<String> = args
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let is_chromium = is_chromium_binary(app);
+        if is_chromium
+            && !launch_args
+                .iter()
+                .any(|a| a == "--force-renderer-accessibility")
+        {
+            launch_args.insert(0, "--force-renderer-accessibility".to_string());
+        }
+
+        let spawn_bin =
+            |bin: &str, cmd_args: &[String]| -> std::io::Result<tokio::process::Child> {
+                let mut cmd = tokio::process::Command::new(bin);
+                cmd.args(cmd_args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .env("ACCESSIBILITY_ENABLED", "1")
+                    .env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1")
+                    .env("GTK_MODULES", "gail:atk-bridge");
+                #[cfg(unix)]
+                cmd.process_group(0);
+                cmd.spawn()
+            };
+
+        let (launched_label, child) = match spawn_bin(app, &launch_args) {
+            Ok(c) => (app.to_string(), c),
+            Err(first_err) => {
+                // On Linux, transparently fall back to Flatpak if a well-known app is installed via Flatpak.
+                #[cfg(target_os = "linux")]
+                if let Some(fp_id) = known_flatpak_id(app) {
+                    let mut fp_args = vec!["run".to_string(), fp_id.to_string()];
+                    fp_args.extend(launch_args.clone());
+                    if let Ok(c) = spawn_bin("flatpak", &fp_args) {
+                        (format!("flatpak run {fp_id}"), c)
+                    } else {
+                        return Err(format!("failed to launch '{app}': {first_err}"));
+                    }
+                } else {
+                    return Err(format!("failed to launch '{app}': {first_err}"));
+                }
+                #[cfg(not(target_os = "linux"))]
+                return Err(format!("failed to launch '{app}': {first_err}"));
+            }
+        };
+
+        let pid = child.id().unwrap_or(0);
+        if let Some(mut daemon) = self.try_daemon().await {
+            let _ = daemon.send(&DaemonRequest::Invalidate).await;
+        }
+        Ok(format!(
+            "launched {launched_label} (pid: {pid}) | a11y_env=on | chromium_flag={is_chromium}"
+        ))
     }
 
     async fn tool_click_node(&self, args: &Value) -> Result<String, String> {
@@ -704,6 +816,26 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "launch_app",
+            "description": "Launch a desktop application (e.g. 'brave', 'code', 'konsole', 'libreoffice') with OS accessibility enabled and --force-renderer-accessibility for Chromium/Electron apps (with automatic Flatpak fallback on Linux). Enforces AppPolicy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "description": "Executable name or path (e.g. 'brave', 'code', 'firefox', 'kcalc')."
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional command-line arguments to pass to the application."
+                    }
+                },
+                "required": ["app"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "click_node",
             "description": "Programmatically click/activate a UI node from the latest get_desktop_tree snapshot without moving the mouse cursor.",
             "inputSchema": {
@@ -923,6 +1055,54 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+fn is_chromium_binary(bin: &str) -> bool {
+    let base = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(bin)
+        .to_lowercase();
+    matches!(
+        base.as_str(),
+        "code"
+            | "code-insiders"
+            | "chromium"
+            | "chromium-browser"
+            | "google-chrome"
+            | "google-chrome-stable"
+            | "brave"
+            | "brave-browser"
+            | "discord"
+            | "slack"
+            | "obsidian"
+            | "electron"
+            | "opera"
+            | "vivaldi"
+            | "microsoft-edge"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn known_flatpak_id(app: &str) -> Option<&'static str> {
+    match app.to_lowercase().as_str() {
+        "brave" | "brave-browser" => Some("com.brave.Browser"),
+        "chromium" | "chromium-browser" => Some("org.chromium.Chromium"),
+        "chrome" | "google-chrome" => Some("com.google.Chrome"),
+        "code" | "vscode" => Some("com.visualstudio.code"),
+        "discord" => Some("com.discordapp.Discord"),
+        "slack" => Some("com.slack.Slack"),
+        "obsidian" => Some("md.obsidian.Obsidian"),
+        "opera" => Some("com.opera.Opera"),
+        "vivaldi" => Some("com.vivaldi.Vivaldi"),
+        "firefox" => Some("org.mozilla.firefox"),
+        "libreoffice" => Some("org.libreoffice.LibreOffice"),
+        "konsole" => Some("org.kde.konsole"),
+        "dolphin" => Some("org.kde.dolphin"),
+        "spotify" => Some("com.spotify.Client"),
+        "steam" => Some("com.valvesoftware.Steam"),
+        _ => None,
+    }
 }
 
 fn bounding_box_of_elements(nodes: &[axdom_core::PrunedNode]) -> Option<axdom_core::Bounds> {
@@ -1238,6 +1418,27 @@ mod tests {
         assert_eq!(result["isError"], true);
         assert!(
             result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("policy denied")
+        );
+
+        let launch_denied = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(2)),
+                method: "tools/call".into(),
+                params: Some(json!({
+                    "name": "launch_app",
+                    "arguments": { "app": "keepassxc" }
+                })),
+            })
+            .await
+            .unwrap();
+        let launch_res = launch_denied.result.unwrap();
+        assert_eq!(launch_res["isError"], true);
+        assert!(
+            launch_res["content"][0]["text"]
                 .as_str()
                 .unwrap()
                 .contains("policy denied")
