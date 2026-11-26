@@ -369,6 +369,7 @@ async fn main() -> Result<()> {
                 init::InitMode::Apply
             };
             let exe_path = std::env::current_exe()?;
+            #[allow(unused_mut)]
             let mut actions = init::configure_mcp_clients(&exe_path, init_mode)?;
 
             #[cfg(target_os = "linux")]

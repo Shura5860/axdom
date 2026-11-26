@@ -671,16 +671,23 @@ fn load_restore_token() -> Option<String> {
 }
 
 fn save_restore_token(token: &str) {
-    use std::os::unix::fs::PermissionsExt;
     let Some(path) = portal_token_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     if std::fs::write(&path, format!("{}\n", token.trim())).is_ok() {
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 
