@@ -26,6 +26,10 @@ const REGISTRY_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 
 /// Max concurrent in-flight D-Bus calls during tree traversal to avoid saturating the bus.
 const MAX_CONCURRENT_CALLS: usize = 32;
+/// Hard ceiling on raw nesting depth (so empty web `div` chains can bypass `max_depth` safely).
+const MAX_RAW_DEPTH: usize = 48;
+/// Fast timeout cap for `Cache.GetItems` so huge tables fall back quickly to pruned `walk_node`.
+const CACHE_GET_ITEMS_CAP_MS: u64 = 250;
 
 /// Linux AT-SPI2 implementation of `AccessibilityProvider` with automatic D-Bus reconnection.
 pub struct LinuxProvider {
@@ -171,12 +175,13 @@ impl AccessibilityProvider for LinuxProvider {
             Some(filter) => {
                 let needle = filter.to_lowercase();
                 let mut matches: Vec<_> = handles
-                    .into_iter()
+                    .iter()
                     .filter(|(w, _, _)| {
                         w.id == *filter
                             || w.title.to_lowercase().contains(&needle)
                             || w.app_name.to_lowercase().contains(&needle)
                     })
+                    .cloned()
                     .collect();
                 if matches.is_empty() {
                     return Err(AxdomError::WindowNotFound(filter.clone()));
@@ -190,21 +195,62 @@ impl AccessibilityProvider for LinuxProvider {
                 }
             }
             None => handles
-                .into_iter()
+                .iter()
                 .find(|(w, _, _)| w.active)
+                .cloned()
                 .ok_or(AxdomError::NoActiveWindow)?,
         };
+
+        // Clone secondary visible/showing overlay windows (popups, context menus, modal dialogs)
+        // belonging to the same app bus connection so the agent never misses them.
+        // Iterate in reverse so newest popup/dialog handles take priority over stale background frames.
+        let target_id = target.0.id.clone();
+        let target_dest = target.1.clone();
+        let overlay_handles: Vec<(String, OwnedObjectPath)> = handles
+            .iter()
+            .rev()
+            .filter(|(w, d, _)| w.id != target_id && *d == target_dest)
+            .take(3)
+            .map(|(_, d, p)| (d.clone(), p.clone()))
+            .collect();
 
         let (window, dest, path) = target;
         let conn = self.connection();
 
-        // Fast path: single D-Bus round-trip via `org.a11y.atspi.Cache.GetItems`.
-        if let Ok(Some(cached_tree)) = tokio::time::timeout(
-            Duration::from_millis(query.timeout_ms),
+        // Fast path: single D-Bus round-trip via `org.a11y.atspi.Cache.GetItems` (capped at 250ms).
+        let cache_budget = query.timeout_ms.min(CACHE_GET_ITEMS_CAP_MS);
+        if let Ok(Some(mut cached_tree)) = tokio::time::timeout(
+            Duration::from_millis(cache_budget),
             fetch_window_tree_via_cache(&conn, &window, &dest, &path, query),
         )
         .await
         {
+            if !overlay_handles.is_empty() {
+                let ctx = Arc::new(WalkContext {
+                    conn: conn.clone(),
+                    semaphore: Semaphore::new(MAX_CONCURRENT_CALLS),
+                    visited: AtomicUsize::new(cached_tree.total_raw_nodes),
+                    truncated: AtomicBool::new(cached_tree.truncated),
+                    max_depth: query.max_depth,
+                    max_nodes: query.max_nodes,
+                });
+                let overlay_futs = overlay_handles
+                    .into_iter()
+                    .map(|(od, op)| walk_node(Arc::clone(&ctx), od, op, 0, 0));
+                if let Ok(overlays) = tokio::time::timeout(
+                    Duration::from_millis(query.timeout_ms / 2),
+                    join_all(overlay_futs),
+                )
+                .await
+                {
+                    for ov in overlays.into_iter().flatten() {
+                        if matches!(ov.role, NodeRole::Dialog | NodeRole::Menu) {
+                            cached_tree.root.children.push(ov);
+                        }
+                    }
+                    cached_tree.total_raw_nodes = ctx.visited.load(Ordering::Relaxed);
+                }
+            }
             return Ok(cached_tree);
         }
 
@@ -217,7 +263,20 @@ impl AccessibilityProvider for LinuxProvider {
             max_nodes: query.max_nodes,
         });
 
-        let walk_fut = walk_node(Arc::clone(&ctx), dest, path, 0);
+        let walk_fut = async {
+            let mut root = walk_node(Arc::clone(&ctx), dest, path, 0, 0).await?;
+            if !overlay_handles.is_empty() {
+                let overlay_futs = overlay_handles
+                    .into_iter()
+                    .map(|(od, op)| walk_node(Arc::clone(&ctx), od, op, 0, 0));
+                for ov in join_all(overlay_futs).await.into_iter().flatten() {
+                    if matches!(ov.role, NodeRole::Dialog | NodeRole::Menu) {
+                        root.children.push(ov);
+                    }
+                }
+            }
+            Some(root)
+        };
         let root = tokio::time::timeout(Duration::from_millis(query.timeout_ms), walk_fut)
             .await
             .map_err(|_| AxdomError::Timeout(query.timeout_ms))?
@@ -268,7 +327,8 @@ fn walk_node(
     ctx: Arc<WalkContext>,
     dest: String,
     path: OwnedObjectPath,
-    depth: usize,
+    semantic_depth: usize,
+    raw_depth: usize,
 ) -> BoxFuture<'static, Option<RawNode>> {
     Box::pin(async move {
         if dest.is_empty() || path.as_str() == "/org/a11y/atspi/null" {
@@ -299,7 +359,7 @@ fn walk_node(
         let state = decode_state(&state_bits);
 
         // Early pruning: skip descending into hidden/offscreen subtrees to save D-Bus round-trips.
-        if depth > 0 && !state.visible && !state.showing {
+        if raw_depth > 0 && !state.visible && !state.showing {
             return None;
         }
 
@@ -312,7 +372,7 @@ fn walk_node(
 
         // Lazy bounds: only fetch root window extents during tree walk (for blind-spot screenshot
         // cropping). Per-node bounds are fetched on demand via `fetch_live_bounds` during fallback.
-        let bounds = if depth == 0
+        let bounds = if raw_depth == 0
             && has_interface(&interfaces, "Component")
             && let Ok(comp) = component_proxy(&ctx.conn, dest.clone(), path.clone()).await
         {
@@ -332,9 +392,17 @@ fn walk_node(
         // Fetch text/numeric value for inputs and sliders (password redaction happens in Pruner)
         let value = fetch_value(&ctx.conn, &dest, &path, &interfaces, &role).await;
 
+        // Only advance `semantic_depth` on meaningful/interactive nodes so deep empty web `div`
+        // chains do not exhaust `max_depth` (still bounded by `MAX_RAW_DEPTH`).
+        let next_semantic_depth = if matches!(role, NodeRole::Container) && name.trim().is_empty() {
+            semantic_depth
+        } else {
+            semantic_depth + 1
+        };
+
         // Collect child references before releasing the semaphore permit
         let mut child_refs = Vec::new();
-        if depth < ctx.max_depth && child_count > 0 {
+        if semantic_depth < ctx.max_depth && raw_depth < MAX_RAW_DEPTH && child_count > 0 {
             let cap = (child_count as usize).min(256);
             if (child_count as usize) > cap {
                 ctx.truncated.store(true, Ordering::Relaxed);
@@ -351,9 +419,15 @@ fn walk_node(
         drop(_permit);
 
         let children: Vec<RawNode> = if !child_refs.is_empty() {
-            let child_futs = child_refs
-                .into_iter()
-                .map(|(c_dest, c_path)| walk_node(Arc::clone(&ctx), c_dest, c_path, depth + 1));
+            let child_futs = child_refs.into_iter().map(|(c_dest, c_path)| {
+                walk_node(
+                    Arc::clone(&ctx),
+                    c_dest,
+                    c_path,
+                    next_semantic_depth,
+                    raw_depth + 1,
+                )
+            });
             join_all(child_futs).await.into_iter().flatten().collect()
         } else {
             Vec::new()

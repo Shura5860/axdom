@@ -71,20 +71,46 @@ impl KeyCombo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionRequest {
     Click,
-    ClickCoords { x: i32, y: i32 },
+    RightClick,
+    DoubleClick,
+    Hover,
+    ClickCoords {
+        x: i32,
+        y: i32,
+    },
+    /// Drag from the target node's center coordinates to `(to_x, to_y)`.
+    DragTo {
+        to_x: i32,
+        to_y: i32,
+    },
     Focus,
-    SetText { text: String },
-    SetValue { value: f64 },
+    SetText {
+        text: String,
+    },
+    SetValue {
+        value: f64,
+    },
+    /// Scroll horizontally/vertically (`delta_x > 0` right, `delta_y > 0` down).
+    Scroll {
+        #[serde(default)]
+        delta_x: i32,
+        delta_y: i32,
+    },
 }
 
 impl ActionRequest {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Click => "click",
+            Self::RightClick => "right_click",
+            Self::DoubleClick => "double_click",
+            Self::Hover => "hover",
             Self::ClickCoords { .. } => "click_coords",
+            Self::DragTo { .. } => "drag_to",
             Self::Focus => "focus",
             Self::SetText { .. } => "set_text",
             Self::SetValue { .. } => "set_value",
+            Self::Scroll { .. } => "scroll",
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::model::{NodeRole, PrunedNode, RawNode, TreeSnapshot};
@@ -46,24 +46,18 @@ impl Pruner {
         let mut interactive_count = 0usize;
 
         let mut elements = Vec::new();
-        for (idx, child) in raw.root.children.iter().enumerate() {
-            self.prune_node(
-                child,
-                "root",
-                idx,
-                &mut used_ids,
-                &mut interactive_count,
-                &mut elements,
-            );
-        }
+        self.prune_children(
+            &raw.root.children,
+            "root",
+            &mut used_ids,
+            &mut interactive_count,
+            &mut elements,
+        );
 
         let blind_spot = interactive_count < self.config.blind_spot_threshold;
         let mut warnings = Vec::new();
         if blind_spot {
-            warnings.push(
-                "Window exposes very few interactive accessibility nodes (possible canvas/game or disabled app a11y); visual fallback recommended."
-                    .to_string(),
-            );
+            warnings.push(blind_spot_message(&raw.window.app_name, &raw.window.title));
         }
         if raw.truncated {
             warnings.push(format!(
@@ -84,11 +78,51 @@ impl Pruner {
         }
     }
 
+    fn prune_children(
+        &self,
+        children: &[RawNode],
+        parent_sig: &str,
+        used_ids: &mut HashSet<String>,
+        interactive_count: &mut usize,
+        out: &mut Vec<PrunedNode>,
+    ) {
+        // Count how many siblings share the same (role, effective_name) so unique controls keep
+        // stable IDs even when new items are inserted above them in a list.
+        let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+        for child in children {
+            let eff = effective_node_name(child);
+            *counts.entry((child.role.compact_label(), eff)).or_insert(0) += 1;
+        }
+        let mut seen_occ: HashMap<(&str, &str), usize> = HashMap::new();
+
+        for child in children {
+            let eff = effective_node_name(child);
+            let key = (child.role.compact_label(), eff);
+            let total = counts.get(&key).copied().unwrap_or(1);
+            let occ = seen_occ.entry(key).or_insert(0);
+            let disambiguator = if total > 1 || eff.is_empty() {
+                Some(*occ)
+            } else {
+                None
+            };
+            *occ += 1;
+
+            self.prune_node(
+                child,
+                parent_sig,
+                disambiguator,
+                used_ids,
+                interactive_count,
+                out,
+            );
+        }
+    }
+
     fn prune_node(
         &self,
         node: &RawNode,
         parent_sig: &str,
-        sibling_idx: usize,
+        disambiguator: Option<usize>,
         used_ids: &mut HashSet<String>,
         interactive_count: &mut usize,
         out: &mut Vec<PrunedNode>,
@@ -104,31 +138,32 @@ impl Pruner {
             return;
         }
 
-        let effective_name = if !node.name.trim().is_empty() {
-            node.name.trim()
-        } else {
-            node.description.as_deref().map(str::trim).unwrap_or("")
+        let effective_name = effective_node_name(node);
+
+        let current_sig = match disambiguator {
+            Some(idx) => format!(
+                "{}/{}:{}:{}",
+                parent_sig,
+                node.role.compact_label(),
+                effective_name,
+                idx
+            ),
+            None => format!(
+                "{}/{}:{}",
+                parent_sig,
+                node.role.compact_label(),
+                effective_name
+            ),
         };
 
-        let current_sig = format!(
-            "{}/{}:{}:{}",
-            parent_sig,
-            node.role.compact_label(),
-            effective_name,
-            sibling_idx
-        );
-
         let mut pruned_children = Vec::new();
-        for (idx, child) in node.children.iter().enumerate() {
-            self.prune_node(
-                child,
-                &current_sig,
-                idx,
-                used_ids,
-                interactive_count,
-                &mut pruned_children,
-            );
-        }
+        self.prune_children(
+            &node.children,
+            &current_sig,
+            used_ids,
+            interactive_count,
+            &mut pruned_children,
+        );
 
         let is_interactive = node.role.is_interactive() || node.state.editable;
         let has_meaningful_text = !effective_name.is_empty()
@@ -177,6 +212,37 @@ impl Pruner {
             children: pruned_children,
         });
     }
+}
+
+fn effective_node_name(node: &RawNode) -> &str {
+    if !node.name.trim().is_empty() {
+        node.name.trim()
+    } else {
+        node.description.as_deref().map(str::trim).unwrap_or("")
+    }
+}
+
+fn blind_spot_message(app_name: &str, title: &str) -> String {
+    let haystack = format!("{} {}", app_name.to_lowercase(), title.to_lowercase());
+    if [
+        "brave", "chrome", "chromium", "code", "electron", "discord", "slack", "obsidian", "opera",
+        "vivaldi",
+    ]
+    .iter()
+    .any(|k| haystack.contains(k))
+    {
+        return "Chromium/Electron app exposes too few accessibility nodes (accessibility tree likely disabled). Run `axdom setup` once and fully restart the app (Ctrl+Q), or use `axdom launch <app>`."
+            .to_string();
+    }
+    if ["jetbrains", "idea", "pycharm", "webstorm", "clion", "java"]
+        .iter()
+        .any(|k| haystack.contains(k))
+    {
+        return "Java/JetBrains app exposes too few accessibility nodes (install `java-atk-wrapper` or call `capture_screenshot` for visual inspection)."
+            .to_string();
+    }
+    "Window exposes very few interactive accessibility nodes (possible canvas/game/custom UI); call `capture_screenshot` for visual inspection."
+        .to_string()
 }
 
 fn sanitize_value(role: &NodeRole, value: Option<&str>, max_len: usize) -> Option<String> {
@@ -346,5 +412,35 @@ mod tests {
 
         assert_eq!(snapshot.elements.len(), 1);
         assert!(snapshot.elements[0].children.is_empty());
+    }
+
+    #[test]
+    fn keeps_unique_node_id_stable_when_sibling_inserted_above() {
+        let make_tree = |children: Vec<RawNode>| RawWindowTree {
+            window: WindowInfo {
+                id: "w4".into(),
+                title: "App".into(),
+                app_name: "app".into(),
+                pid: Some(1),
+                active: true,
+            },
+            root: raw_node(NodeRole::Window, "App", None, children),
+            total_raw_nodes: 4,
+            truncated: false,
+        };
+
+        let pruner = Pruner::new(PrunerConfig::default());
+        let before = pruner.prune(make_tree(vec![raw_node(
+            NodeRole::Button,
+            "Save",
+            None,
+            vec![],
+        )]));
+        let after = pruner.prune(make_tree(vec![
+            raw_node(NodeRole::Button, "New Notification", None, vec![]),
+            raw_node(NodeRole::Button, "Save", None, vec![]),
+        ]));
+
+        assert_eq!(before.elements[0].id, after.elements[1].id);
     }
 }

@@ -7,6 +7,7 @@ description = "Platform-independent accessibility tree models, pruner, and seria
 
 [dependencies]
 async-trait.workspace = true
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

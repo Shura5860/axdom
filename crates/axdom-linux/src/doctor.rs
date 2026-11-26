@@ -14,37 +14,69 @@ const FLAG_CONFIG_FILES: &[&str] = &[
     "electron-flags.conf",
 ];
 
+/// Known Flatpak Chromium/Electron app IDs and the flag file name read inside
+/// `~/.var/app/<app_id>/config/`.
+const FLATPAK_FLAG_APPS: &[(&str, &str)] = &[
+    ("com.brave.Browser", "brave-flags.conf"),
+    ("org.chromium.Chromium", "chromium-flags.conf"),
+    ("com.google.Chrome", "chrome-flags.conf"),
+    ("com.visualstudio.code", "code-flags.conf"),
+    ("com.discordapp.Discord", "discord-flags.conf"),
+    ("com.slack.Slack", "slack-flags.conf"),
+    ("md.obsidian.Obsidian", "obsidian-flags.conf"),
+    ("com.opera.Opera", "opera-flags.conf"),
+    ("com.vivaldi.Vivaldi", "vivaldi-flags.conf"),
+];
+
 /// Idempotently writes `--force-renderer-accessibility` into standard Linux Chromium/Electron
-/// flag files under `$XDG_CONFIG_HOME` (or `$HOME/.config`) so Brave, Chrome, VS Code, and
-/// Electron apps expose their accessibility tree automatically on launch.
+/// flag files under `$XDG_CONFIG_HOME` (or `$HOME/.config`) AND into any installed Flatpak
+/// app config directories under `$HOME/.var/app/<app_id>/config/`.
 pub fn apply_chromium_a11y_flags() -> std::io::Result<Vec<String>> {
     let config_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .ok_or_else(|| std::io::Error::other("neither XDG_CONFIG_HOME nor HOME is set"))?;
-    apply_chromium_a11y_flags_in(&config_dir)
+    let flatpak_root = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".var").join("app"));
+    apply_chromium_a11y_flags_in(&config_dir, flatpak_root.as_deref())
 }
 
-pub fn apply_chromium_a11y_flags_in(config_dir: &Path) -> std::io::Result<Vec<String>> {
+pub fn apply_chromium_a11y_flags_in(
+    config_dir: &Path,
+    flatpak_root: Option<&Path>,
+) -> std::io::Result<Vec<String>> {
     std::fs::create_dir_all(config_dir)?;
     let mut actions = Vec::new();
     for filename in FLAG_CONFIG_FILES {
-        let path = config_dir.join(filename);
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if existing.lines().any(|line| line.trim() == CHROMIUM_FLAG) {
-            actions.push(format!("already set: {}", path.display()));
-            continue;
-        }
-        let mut updated = existing;
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str(CHROMIUM_FLAG);
-        updated.push('\n');
-        std::fs::write(&path, updated)?;
-        actions.push(format!("updated:     {}", path.display()));
+        actions.push(ensure_flag_in_file(&config_dir.join(filename))?);
     }
+
+    if let Some(fp_root) = flatpak_root {
+        for (app_id, filename) in FLATPAK_FLAG_APPS {
+            let app_dir = fp_root.join(app_id);
+            if app_dir.is_dir() {
+                let fp_config = app_dir.join("config");
+                std::fs::create_dir_all(&fp_config)?;
+                actions.push(ensure_flag_in_file(&fp_config.join(filename))?);
+            }
+        }
+    }
+
     Ok(actions)
+}
+
+fn ensure_flag_in_file(path: &Path) -> std::io::Result<String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == CHROMIUM_FLAG) {
+        return Ok(format!("already set: {}", path.display()));
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(CHROMIUM_FLAG);
+    updated.push('\n');
+    std::fs::write(path, updated)?;
+    Ok(format!("updated:     {}", path.display()))
 }
 
 pub async fn run_doctor() -> DoctorReport {
@@ -231,19 +263,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn writes_chromium_flags_idempotently() {
+    fn writes_chromium_and_flatpak_flags_idempotently() {
         let tmp = std::env::temp_dir().join(format!("axdom-flags-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        let cfg = tmp.join("config");
+        let fp = tmp.join("flatpak");
+        std::fs::create_dir_all(fp.join("com.brave.Browser")).unwrap();
 
-        let first = apply_chromium_a11y_flags_in(&tmp).unwrap();
-        assert_eq!(first.len(), FLAG_CONFIG_FILES.len());
+        let first = apply_chromium_a11y_flags_in(&cfg, Some(&fp)).unwrap();
+        assert_eq!(first.len(), FLAG_CONFIG_FILES.len() + 1);
         assert!(first.iter().all(|s| s.starts_with("updated:")));
 
-        let second = apply_chromium_a11y_flags_in(&tmp).unwrap();
+        let second = apply_chromium_a11y_flags_in(&cfg, Some(&fp)).unwrap();
         assert!(second.iter().all(|s| s.starts_with("already set:")));
 
-        let brave = std::fs::read_to_string(tmp.join("brave-flags.conf")).unwrap();
-        assert_eq!(brave.trim(), CHROMIUM_FLAG);
+        let fp_brave =
+            std::fs::read_to_string(fp.join("com.brave.Browser/config/brave-flags.conf")).unwrap();
+        assert_eq!(fp_brave.trim(), CHROMIUM_FLAG);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

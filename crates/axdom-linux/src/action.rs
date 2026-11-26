@@ -2,7 +2,10 @@ use axdom_core::{ActionRequest, ActionResult, AxdomError, NodeRef, Result};
 use zbus::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
-use crate::input::send_coord_click;
+use crate::input::{
+    send_coord_click, send_double_click, send_drag, send_hover, send_right_click, send_scroll,
+};
+use crate::portal::type_text_via_portal;
 use crate::provider::{has_interface, map_atspi_role};
 use crate::proxy::{
     accessible_proxy, action_proxy, component_proxy, editable_text_proxy, value_proxy,
@@ -11,6 +14,15 @@ use crate::proxy::{
 /// Priority order for normalizing "click" across GTK, Qt, Firefox, Electron, and LibreOffice.
 const CLICK_ACTION_PRIORITY: &[&str] = &[
     "click", "press", "activate", "jump", "open", "toggle", "select",
+];
+
+/// Non-click helper actions to skip when falling back to localized action names (e.g. "Tıkla").
+const NON_CLICK_ACTIONS: &[&str] = &[
+    "setfocus",
+    "set focus",
+    "showmenu",
+    "show menu",
+    "showlongdesc",
 ];
 
 /// Splits a Linux `backend_ref` formatted as `<bus_name>:<object_path>`.
@@ -75,6 +87,20 @@ pub async fn fetch_live_bounds(conn: &Connection, backend_ref: &str) -> Option<a
         .filter(|b| !b.is_zero_sized())
 }
 
+async fn resolve_node_center(conn: &Connection, node: &NodeRef) -> Result<(i32, i32)> {
+    let bounds = match node.bounds.filter(|b| !b.is_zero_sized()) {
+        Some(b) => Some(b),
+        None => fetch_live_bounds(conn, &node.backend_ref).await,
+    };
+    let Some(b) = bounds else {
+        return Err(AxdomError::ActionUnsupported(format!(
+            "node {} has no valid screen bounds for pointer action",
+            node.id
+        )));
+    };
+    Ok((b.x + b.width / 2, b.y + b.height / 2))
+}
+
 /// Dispatches an `ActionRequest` directly over AT-SPI2 (coordinate-free, Wayland-safe).
 pub async fn dispatch_action(
     conn: &Connection,
@@ -82,6 +108,13 @@ pub async fn dispatch_action(
     action: &ActionRequest,
     verify: bool,
 ) -> Result<ActionResult> {
+    if let ActionRequest::ClickCoords { x, y } = action
+        && (*x != 0 || *y != 0)
+        && node.backend_ref.is_empty()
+    {
+        return send_coord_click(&node.id, *x, *y).await;
+    }
+
     if verify {
         verify_live_node(conn, node).await?;
     }
@@ -90,15 +123,26 @@ pub async fn dispatch_action(
 
     match action {
         ActionRequest::Click => dispatch_click(conn, node, &dest, &path).await,
+        ActionRequest::RightClick => {
+            let (x, y) = resolve_node_center(conn, node).await?;
+            send_right_click(&node.id, x, y).await
+        }
+        ActionRequest::DoubleClick => {
+            let (x, y) = resolve_node_center(conn, node).await?;
+            send_double_click(&node.id, x, y).await
+        }
+        ActionRequest::Hover => {
+            let (x, y) = resolve_node_center(conn, node).await?;
+            send_hover(&node.id, x, y).await
+        }
+        ActionRequest::DragTo { to_x, to_y } => {
+            let (from_x, from_y) = resolve_node_center(conn, node).await?;
+            send_drag(&node.id, from_x, from_y, *to_x, *to_y).await
+        }
         ActionRequest::ClickCoords { x, y } => {
             if *x == 0 && *y == 0 {
-                let Some(b) = fetch_live_bounds(conn, &node.backend_ref).await else {
-                    return Err(AxdomError::ActionUnsupported(format!(
-                        "node {} has no valid screen bounds for coordinate fallback",
-                        node.id
-                    )));
-                };
-                return send_coord_click(&node.id, b.x + b.width / 2, b.y + b.height / 2).await;
+                let (cx, cy) = resolve_node_center(conn, node).await?;
+                return send_coord_click(&node.id, cx, cy).await;
             }
             send_coord_click(&node.id, *x, *y).await
         }
@@ -106,6 +150,13 @@ pub async fn dispatch_action(
         ActionRequest::SetText { text } => dispatch_set_text(conn, node, &dest, &path, text).await,
         ActionRequest::SetValue { value } => {
             dispatch_set_value(conn, node, &dest, &path, *value).await
+        }
+        ActionRequest::Scroll { delta_x, delta_y } => {
+            // Focus the target widget first (best-effort) so scroll goes to the right pane.
+            if let Ok(comp) = component_proxy(conn, dest, path).await {
+                let _ = comp.grab_focus().await;
+            }
+            send_scroll(&node.id, *delta_x, *delta_y).await
         }
     }
 }
@@ -200,6 +251,21 @@ async fn dispatch_set_text(
         .map_err(|e| AxdomError::Backend(e.to_string()))?;
     let ifaces = acc.get_interfaces().await.unwrap_or_default();
     if !has_interface(&ifaces, "EditableText") {
+        // For rich contenteditable / JS editors (e.g. Monaco, Notion) that expose Input role
+        // without AT-SPI2 EditableText, focus and fall back to XDG RemoteDesktop portal typing.
+        if matches!(
+            node.role,
+            axdom_core::NodeRole::Input
+                | axdom_core::NodeRole::PasswordInput
+                | axdom_core::NodeRole::ComboBox
+        ) {
+            if let Ok(comp) = component_proxy(conn, dest.to_string(), path.clone()).await {
+                let _ = comp.grab_focus().await;
+            }
+            if let Ok(res) = type_text_via_portal(&node.id, text, true).await {
+                return Ok(res);
+            }
+        }
         return Err(AxdomError::ActionUnsupported(format!(
             "node {} ({} {:?}) does not implement AT-SPI2 EditableText",
             node.id,
@@ -271,7 +337,7 @@ async fn dispatch_set_value(
     })
 }
 
-/// Picks the best AT-SPI2 action index for a semantic "click" across different toolkits.
+/// Picks the best AT-SPI2 action index for a semantic "click" across different toolkits and locales.
 pub fn pick_click_action_index(action_names: &[String]) -> Option<usize> {
     if action_names.is_empty() {
         return None;
@@ -284,6 +350,13 @@ pub fn pick_click_action_index(action_names: &[String]) -> Option<usize> {
         {
             return Some(idx);
         }
+    }
+    // Localized fallback (e.g. Turkish "Tıkla"): pick the first action that isn't SetFocus/ShowMenu.
+    if let Some((idx, _)) = action_names.iter().enumerate().find(|(_, name)| {
+        let lower = name.trim().to_lowercase();
+        !lower.is_empty() && !NON_CLICK_ACTIONS.iter().any(|skip| lower == *skip)
+    }) {
+        return Some(idx);
     }
     Some(0)
 }

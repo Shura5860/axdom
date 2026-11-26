@@ -108,6 +108,7 @@ pub fn build_tree_from_cache_items(
         dest,
         root_path,
         0,
+        0,
         query,
         &mut visited_count,
         &mut truncated,
@@ -122,12 +123,15 @@ pub fn build_tree_from_cache_items(
     })
 }
 
+const MAX_CACHE_RAW_DEPTH: usize = 48;
+
 #[allow(clippy::too_many_arguments)]
 fn build_node<'a>(
     index: &HashMap<(&'a str, &'a str), &'a AtspiCacheItem>,
     dest: &'a str,
     path: &'a str,
-    depth: usize,
+    semantic_depth: usize,
+    raw_depth: usize,
     query: &TreeQuery,
     visited_count: &mut usize,
     truncated: &mut bool,
@@ -145,9 +149,17 @@ fn build_node<'a>(
     let item = *index.get(&(dest, path))?;
     *visited_count += 1;
 
+    let role = map_atspi_role(item.6);
+    let next_semantic_depth =
+        if matches!(role, axdom_core::NodeRole::Container) && item.5.trim().is_empty() {
+            semantic_depth
+        } else {
+            semantic_depth + 1
+        };
+
     let children_refs = &item.3;
     let mut children = Vec::new();
-    if depth < query.max_depth {
+    if semantic_depth < query.max_depth && raw_depth < MAX_CACHE_RAW_DEPTH {
         for (c_dest, c_path) in children_refs {
             let child_dest = if c_dest.is_empty() {
                 dest
@@ -158,7 +170,8 @@ fn build_node<'a>(
                 index,
                 child_dest,
                 c_path.as_str(),
-                depth + 1,
+                next_semantic_depth,
+                raw_depth + 1,
                 query,
                 visited_count,
                 truncated,
@@ -175,7 +188,7 @@ fn build_node<'a>(
 
     Some(RawNode {
         backend_ref: format!("{dest}:{path}"),
-        role: map_atspi_role(item.6),
+        role,
         name: item.5.clone(),
         description: (!item.7.trim().is_empty()).then(|| item.7.clone()),
         value: None,

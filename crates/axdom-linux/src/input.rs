@@ -1,11 +1,19 @@
 use std::path::PathBuf;
 
 use axdom_core::{
-    ActionResult, AxdomError, Bounds, KeyCombo, KeyModifier, Result, Screenshot, encode_base64,
+    ActionResult, AxdomError, Bounds, KeyCombo, KeyModifier, Result, Screenshot, crop_png_bytes,
+    encode_base64,
 };
 use tokio::process::Command;
 
-/// Sends a keyboard shortcut via the first available Linux input tool (`wtype`, `xdotool`, `ydotool`).
+use crate::portal::{
+    BTN_LEFT, BTN_RIGHT, capture_screenshot_via_portal, send_key_via_portal,
+    send_pointer_click_via_portal, send_pointer_drag_via_portal, send_pointer_hover_via_portal,
+    send_scroll_via_portal,
+};
+
+/// Sends a keyboard shortcut via `wtype` (Wayland), native XDG Desktop Portal `RemoteDesktop`
+/// (built into KDE KWin / GNOME Mutter / Hyprland — zero external tools), or `xdotool` (X11).
 pub async fn send_key_combo(combo: &KeyCombo) -> Result<ActionResult> {
     let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
 
@@ -21,7 +29,7 @@ pub async fn send_key_combo(combo: &KeyCombo) -> Result<ActionResult> {
         });
     }
 
-    if command_exists("xdotool") {
+    if !is_wayland && command_exists("xdotool") {
         let key_spec = build_xdotool_spec(combo);
         let args = vec!["key".to_string(), "--clearmodifiers".to_string(), key_spec];
         run_tool("xdotool", &args).await?;
@@ -34,14 +42,37 @@ pub async fn send_key_combo(combo: &KeyCombo) -> Result<ActionResult> {
         });
     }
 
-    Err(AxdomError::ActionUnsupported(
-        "no supported Linux key-injection tool found in PATH (install `wtype` on Wayland or `xdotool` on X11)"
-            .to_string(),
-    ))
+    // Native pure-Rust XDG Desktop Portal RemoteDesktop (works on Wayland without wtype/xdotool).
+    match send_key_via_portal(combo).await {
+        Ok(res) => Ok(res),
+        Err(portal_err) => {
+            if command_exists("xdotool") {
+                let key_spec = build_xdotool_spec(combo);
+                let args = vec!["key".to_string(), "--clearmodifiers".to_string(), key_spec];
+                run_tool("xdotool", &args).await?;
+                return Ok(ActionResult {
+                    node_id: "keyboard".to_string(),
+                    action: "press_key".to_string(),
+                    method_used: "fallback:xdotool".to_string(),
+                    success: true,
+                    detail: Some(format!("args={args:?}")),
+                });
+            }
+            Err(AxdomError::ActionUnsupported(format!(
+                "key injection failed via XDG RemoteDesktop portal ({portal_err}) and neither `wtype` nor `xdotool` is in PATH"
+            )))
+        }
+    }
 }
 
-/// Sends a coordinate-based mouse click fallback via `ydotool` (Wayland priority) or `xdotool`.
+/// Sends a coordinate-based mouse click via native XDG `RemoteDesktop` portal (Wayland, zero
+/// external tools), falling back to `ydotool` or `xdotool`.
 pub async fn send_coord_click(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
+    if let Ok(res) = send_pointer_click_via_portal(node_id, x, y, BTN_LEFT, 1, "click_coords").await
+    {
+        return Ok(res);
+    }
+
     let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
 
     if is_wayland && command_exists("ydotool") {
@@ -55,8 +86,220 @@ pub async fn send_coord_click(node_id: &str, x: i32, y: i32) -> Result<ActionRes
     }
 
     Err(AxdomError::ActionUnsupported(format!(
-        "coordinate fallback click at ({x}, {y}) requires `ydotool` (Wayland/uinput) or `xdotool` (X11) in PATH"
+        "coordinate fallback click at ({x}, {y}) failed via XDG portal and neither `ydotool` nor `xdotool` is in PATH"
     )))
+}
+
+/// Sends a right-click (context menu) at `(x, y)` via XDG portal, `ydotool`, or `xdotool`.
+pub async fn send_right_click(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
+    if let Ok(res) = send_pointer_click_via_portal(node_id, x, y, BTN_RIGHT, 1, "right_click").await
+    {
+        return Ok(res);
+    }
+    if command_exists("ydotool") {
+        let move_args = vec![
+            "mousemove".into(),
+            "--absolute".into(),
+            "-x".into(),
+            x.to_string(),
+            "-y".into(),
+            y.to_string(),
+        ];
+        run_tool("ydotool", &move_args).await?;
+        run_tool("ydotool", &["click".into(), "0xC1".into()]).await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "right_click".into(),
+            method_used: format!("fallback:ydotool-right({x},{y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    if command_exists("xdotool") {
+        let args = vec![
+            "mousemove".into(),
+            x.to_string(),
+            y.to_string(),
+            "click".into(),
+            "3".into(),
+        ];
+        run_tool("xdotool", &args).await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "right_click".into(),
+            method_used: format!("fallback:xdotool-right({x},{y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    Err(AxdomError::ActionUnsupported(format!(
+        "right_click at ({x}, {y}) requires XDG RemoteDesktop portal, `ydotool`, or `xdotool`"
+    )))
+}
+
+/// Sends a double-click at `(x, y)` via XDG portal, `ydotool`, or `xdotool`.
+pub async fn send_double_click(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
+    if let Ok(res) = send_pointer_click_via_portal(node_id, x, y, BTN_LEFT, 2, "double_click").await
+    {
+        return Ok(res);
+    }
+    if command_exists("ydotool") {
+        let move_args = vec![
+            "mousemove".into(),
+            "--absolute".into(),
+            "-x".into(),
+            x.to_string(),
+            "-y".into(),
+            y.to_string(),
+        ];
+        run_tool("ydotool", &move_args).await?;
+        run_tool(
+            "ydotool",
+            &["click".into(), "--repeat".into(), "2".into(), "0xC0".into()],
+        )
+        .await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "double_click".into(),
+            method_used: format!("fallback:ydotool-double({x},{y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    if command_exists("xdotool") {
+        let args = vec![
+            "mousemove".into(),
+            x.to_string(),
+            y.to_string(),
+            "click".into(),
+            "--repeat".into(),
+            "2".into(),
+            "1".into(),
+        ];
+        run_tool("xdotool", &args).await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "double_click".into(),
+            method_used: format!("fallback:xdotool-double({x},{y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    Err(AxdomError::ActionUnsupported(format!(
+        "double_click at ({x}, {y}) requires XDG RemoteDesktop portal, `ydotool`, or `xdotool`"
+    )))
+}
+
+/// Moves the pointer to `(x, y)` (hover) via XDG portal, `ydotool`, or `xdotool`.
+pub async fn send_hover(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
+    if let Ok(res) = send_pointer_hover_via_portal(node_id, x, y).await {
+        return Ok(res);
+    }
+    if command_exists("ydotool") {
+        let move_args = vec![
+            "mousemove".into(),
+            "--absolute".into(),
+            "-x".into(),
+            x.to_string(),
+            "-y".into(),
+            y.to_string(),
+        ];
+        run_tool("ydotool", &move_args).await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "hover".into(),
+            method_used: format!("fallback:ydotool-move({x},{y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    if command_exists("xdotool") {
+        let args = vec!["mousemove".into(), x.to_string(), y.to_string()];
+        run_tool("xdotool", &args).await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "hover".into(),
+            method_used: format!("fallback:xdotool-move({x},{y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    Err(AxdomError::ActionUnsupported(format!(
+        "hover at ({x}, {y}) requires XDG RemoteDesktop portal, `ydotool`, or `xdotool`"
+    )))
+}
+
+/// Drags with left button held from `(from_x, from_y)` to `(to_x, to_y)` via XDG portal, `ydotool`, or `xdotool`.
+pub async fn send_drag(
+    node_id: &str,
+    from_x: i32,
+    from_y: i32,
+    to_x: i32,
+    to_y: i32,
+) -> Result<ActionResult> {
+    if let Ok(res) = send_pointer_drag_via_portal(node_id, from_x, from_y, to_x, to_y).await {
+        return Ok(res);
+    }
+    if command_exists("ydotool") {
+        run_tool(
+            "ydotool",
+            &[
+                "mousemove".into(),
+                "--absolute".into(),
+                "-x".into(),
+                from_x.to_string(),
+                "-y".into(),
+                from_y.to_string(),
+            ],
+        )
+        .await?;
+        run_tool("ydotool", &["click".into(), "0x40".into()]).await?;
+        run_tool(
+            "ydotool",
+            &[
+                "mousemove".into(),
+                "--absolute".into(),
+                "-x".into(),
+                to_x.to_string(),
+                "-y".into(),
+                to_y.to_string(),
+            ],
+        )
+        .await?;
+        run_tool("ydotool", &["click".into(), "0x80".into()]).await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "drag_to".into(),
+            method_used: format!("fallback:ydotool-drag({from_x},{from_y}->{to_x},{to_y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    if command_exists("xdotool") {
+        let args = vec![
+            "mousemove".into(),
+            from_x.to_string(),
+            from_y.to_string(),
+            "mousedown".into(),
+            "1".into(),
+            "mousemove".into(),
+            to_x.to_string(),
+            to_y.to_string(),
+            "mouseup".into(),
+            "1".into(),
+        ];
+        run_tool("xdotool", &args).await?;
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "drag_to".into(),
+            method_used: format!("fallback:xdotool-drag({from_x},{from_y}->{to_x},{to_y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    Err(AxdomError::ActionUnsupported(
+        "drag_to requires XDG RemoteDesktop portal or `xdotool`".into(),
+    ))
 }
 
 async fn run_xdotool_click(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
@@ -98,7 +341,7 @@ async fn run_ydotool_click(node_id: &str, x: i32, y: i32) -> Result<ActionResult
     })
 }
 
-/// Captures a PNG screenshot (optionally cropped to `bounds`) and returns raw PNG bytes + tool name.
+/// Captures a PNG screenshot (optionally cropped to `bounds` when supported) and returns raw PNG bytes + tool name.
 pub async fn capture_screen_bytes(bounds: Option<Bounds>) -> Result<(Vec<u8>, String)> {
     let tmp_path = PathBuf::from(format!(
         "/tmp/axdom-shot-{}-{}.png",
@@ -109,35 +352,57 @@ pub async fn capture_screen_bytes(bounds: Option<Bounds>) -> Result<(Vec<u8>, St
             .unwrap_or(0)
     ));
     let out_str = tmp_path.to_string_lossy().to_string();
+    let mut tried_method: Option<&str> = None;
 
-    let method = if command_exists("grim") {
+    if command_exists("grim") {
         let mut args = Vec::new();
         if let Some(geom) = bounds.and_then(format_grim_geometry) {
             args.push("-g".to_string());
             args.push(geom);
         }
         args.push(out_str.clone());
-        run_tool("grim", &args).await?;
-        "grim"
-    } else if command_exists("gnome-screenshot") {
-        run_tool("gnome-screenshot", &["-f".to_string(), out_str.clone()]).await?;
-        "gnome-screenshot"
-    } else if command_exists("scrot") {
-        run_tool("scrot", std::slice::from_ref(&out_str)).await?;
-        "scrot"
-    } else {
-        return Err(AxdomError::ActionUnsupported(
-            "no screenshot tool found in PATH (install `grim` on Wayland, or `gnome-screenshot`/`scrot`)"
-                .to_string(),
-        ));
-    };
+        if run_tool("grim", &args).await.is_ok() {
+            tried_method = Some("grim");
+        }
+    }
 
-    let bytes = tokio::fs::read(&tmp_path)
-        .await
-        .map_err(|e| AxdomError::ActionFailed(format!("read captured screenshot: {e}")))?;
-    let _ = tokio::fs::remove_file(&tmp_path).await;
+    if tried_method.is_none()
+        && command_exists("gnome-screenshot")
+        && run_tool("gnome-screenshot", &["-f".to_string(), out_str.clone()])
+            .await
+            .is_ok()
+    {
+        tried_method = Some("gnome-screenshot");
+    }
 
-    Ok((bytes, format!("screenshot:{method}")))
+    if tried_method.is_none()
+        && command_exists("scrot")
+        && run_tool("scrot", std::slice::from_ref(&out_str))
+            .await
+            .is_ok()
+    {
+        tried_method = Some("scrot");
+    }
+
+    if let Some(method) = tried_method {
+        let mut bytes = tokio::fs::read(&tmp_path)
+            .await
+            .map_err(|e| AxdomError::ActionFailed(format!("read captured screenshot: {e}")))?;
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        if method != "grim"
+            && let Some(b) = bounds
+        {
+            bytes = crop_png_bytes(&bytes, b)?;
+        }
+        return Ok((bytes, format!("screenshot:{method}")));
+    }
+
+    // Zero-external-tool native XDG Desktop Portal Screenshot fallback (KDE, GNOME, Hyprland).
+    let (mut bytes, method) = capture_screenshot_via_portal().await?;
+    if let Some(b) = bounds {
+        bytes = crop_png_bytes(&bytes, b)?;
+    }
+    Ok((bytes, method))
 }
 
 /// Captures a PNG screenshot (optionally cropped to `bounds`) for blind-spot visual fallback.
@@ -152,6 +417,43 @@ pub async fn capture_screen_png(bounds: Option<Bounds>) -> Result<Screenshot> {
         method_used,
         bytes_len,
     })
+}
+
+/// Sends vertical and/or horizontal scroll steps via XDG RemoteDesktop portal or `xdotool` (X11).
+pub async fn send_scroll(node_id: &str, delta_x: i32, delta_y: i32) -> Result<ActionResult> {
+    let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if !is_wayland && command_exists("xdotool") {
+        if delta_y != 0 {
+            let button = if delta_y >= 0 { "5" } else { "4" };
+            let repeat = delta_y.unsigned_abs().max(1).to_string();
+            let args = vec![
+                "click".to_string(),
+                "--repeat".to_string(),
+                repeat,
+                button.to_string(),
+            ];
+            run_tool("xdotool", &args).await?;
+        }
+        if delta_x != 0 {
+            let button = if delta_x >= 0 { "7" } else { "6" };
+            let repeat = delta_x.unsigned_abs().max(1).to_string();
+            let args = vec![
+                "click".to_string(),
+                "--repeat".to_string(),
+                repeat,
+                button.to_string(),
+            ];
+            run_tool("xdotool", &args).await?;
+        }
+        return Ok(ActionResult {
+            node_id: node_id.to_string(),
+            action: "scroll".to_string(),
+            method_used: format!("fallback:xdotool(scroll={delta_x},{delta_y})"),
+            success: true,
+            detail: None,
+        });
+    }
+    send_scroll_via_portal(node_id, delta_x, delta_y).await
 }
 
 async fn run_tool(bin: &str, args: &[String]) -> Result<()> {

@@ -10,12 +10,49 @@ use axdom_core::{
     WindowInfo, find_node_ref, format_snapshot, format_windows, scope_snapshot,
 };
 use axdom_daemon::{DaemonClient, DaemonState, default_socket_path, serve_unix};
-use axdom_linux::LinuxProvider;
+#[cfg(target_os = "linux")]
+use axdom_linux::LinuxProvider as PlatformProvider;
+#[cfg(target_os = "linux")]
 use axdom_linux::bus::enable_a11y_if_needed;
-use axdom_linux::doctor::{apply_chromium_a11y_flags, run_doctor};
+#[cfg(target_os = "linux")]
+use axdom_linux::doctor::run_doctor;
+#[cfg(target_os = "linux")]
 use axdom_linux::events::watch_events;
+#[cfg(target_os = "linux")]
+use axdom_linux::setup::run_full_setup;
+#[cfg(target_os = "macos")]
+use axdom_macos::MacOsProvider as PlatformProvider;
 use axdom_mcp::{McpServer, serve_stdio};
+#[cfg(target_os = "windows")]
+use axdom_windows::WindowsProvider as PlatformProvider;
 use clap::{Parser, Subcommand};
+
+#[cfg(not(target_os = "linux"))]
+async fn enable_a11y_if_needed(_enable_screen_reader: bool) -> axdom_core::Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_full_setup() -> axdom_core::Result<Vec<String>> {
+    Ok(vec![
+        "no extra setup required on this OS (accessibility uses native OS APIs)".to_string(),
+    ])
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_doctor() -> axdom_core::DoctorReport {
+    match PlatformProvider::connect().await {
+        Ok(p) => p.doctor().await,
+        Err(e) => axdom_core::DoctorReport {
+            checks: vec![axdom_core::DoctorCheck {
+                name: "platform_a11y".to_string(),
+                status: CheckStatus::Fail,
+                detail: e.to_string(),
+                hint: None,
+            }],
+        },
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,6 +75,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// One-time Linux setup: configure environment.d, Chromium/Electron/Flatpak flags, and .desktop overrides.
+    Setup,
+
     /// Check Linux AT-SPI2 bus, display session, and accessibility flags.
     Doctor {
         /// Attempt to enable org.a11y.Status IsEnabled & ScreenReaderEnabled on the session bus.
@@ -101,7 +141,59 @@ enum Commands {
         /// Text to write into the editable node.
         text: String,
 
+        /// Press Enter immediately after writing text.
+        #[arg(long)]
+        submit: bool,
+
         /// Skip live role/name staleness verification before dispatching.
+        #[arg(long)]
+        no_verify: bool,
+    },
+
+    /// Scroll vertically and/or horizontally on a node.
+    Scroll {
+        /// Node ID from `axdom tree` (with or without leading `#`).
+        id: String,
+
+        /// Vertical scroll steps (e.g. `5` for down, `-5` for up).
+        #[arg(allow_hyphen_values = true, default_value_t = 0)]
+        delta_y: i32,
+
+        /// Horizontal scroll steps (positive = right, negative = left).
+        #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+        delta_x: i32,
+
+        /// Skip live role/name staleness verification before dispatching.
+        #[arg(long)]
+        no_verify: bool,
+    },
+
+    /// Right-click a node (context menu) using its screen bounds.
+    RightClick {
+        id: String,
+        #[arg(long)]
+        no_verify: bool,
+    },
+
+    /// Double-click a node using its screen bounds.
+    DoubleClick {
+        id: String,
+        #[arg(long)]
+        no_verify: bool,
+    },
+
+    /// Hover the pointer over a node using its screen bounds.
+    Hover {
+        id: String,
+        #[arg(long)]
+        no_verify: bool,
+    },
+
+    /// Drag a node to screen coordinates `(to_x, to_y)`.
+    Drag {
+        id: String,
+        to_x: i32,
+        to_y: i32,
         #[arg(long)]
         no_verify: bool,
     },
@@ -247,6 +339,21 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
+        Commands::Setup => {
+            let _ = enable_a11y_if_needed(true).await;
+            let actions = run_full_setup().await?;
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&actions)?);
+            } else {
+                for act in &actions {
+                    println!("[SETUP] {act}");
+                }
+                println!(
+                    "Done. Fully restart any open Chromium/Electron/Brave apps (Ctrl+Q) for flags to take effect."
+                );
+            }
+        }
+
         Commands::Doctor { enable_a11y, fix } => {
             let mut enable_warnings = Vec::new();
             let mut fix_actions = Vec::new();
@@ -257,7 +364,7 @@ async fn main() -> Result<()> {
                 }
             }
             if fix {
-                fix_actions = apply_chromium_a11y_flags()?;
+                fix_actions = run_full_setup().await?;
             }
             let report = run_doctor().await;
             if format == OutputFormat::Json {
@@ -302,7 +409,7 @@ async fn main() -> Result<()> {
                 client.list_windows().await?
             } else {
                 let policy = AppPolicy::default();
-                let provider = LinuxProvider::connect().await?;
+                let provider = PlatformProvider::connect().await?;
                 provider
                     .list_windows()
                     .await?
@@ -336,7 +443,7 @@ async fn main() -> Result<()> {
                 snap
             } else {
                 let policy = AppPolicy::default();
-                let provider = LinuxProvider::connect().await?;
+                let provider = PlatformProvider::connect().await?;
                 let raw = provider.get_window_tree(&query).await?;
                 policy.check_read(&raw.window)?;
                 Pruner::new(PrunerConfig::default()).prune(raw)
@@ -372,11 +479,96 @@ async fn main() -> Result<()> {
         Commands::Type {
             id,
             text,
+            submit,
             no_verify,
         } => {
             run_action(
                 &id,
                 ActionRequest::SetText { text },
+                !no_verify,
+                false,
+                cli.direct,
+                format,
+            )
+            .await?;
+            if submit {
+                let enter = KeyCombo::parse("Enter")?;
+                let res = if !cli.direct
+                    && let Ok(mut client) = DaemonClient::connect_default().await
+                {
+                    client.press_key(enter).await?
+                } else {
+                    let provider = PlatformProvider::connect().await?;
+                    provider.press_key(&enter).await?
+                };
+                if format != OutputFormat::Json {
+                    println!("submit(Enter) -> {} (ok)", res.method_used);
+                }
+            }
+        }
+
+        Commands::Scroll {
+            id,
+            delta_y,
+            delta_x,
+            no_verify,
+        } => {
+            run_action(
+                &id,
+                ActionRequest::Scroll { delta_x, delta_y },
+                !no_verify,
+                false,
+                cli.direct,
+                format,
+            )
+            .await?;
+        }
+
+        Commands::RightClick { id, no_verify } => {
+            run_action(
+                &id,
+                ActionRequest::RightClick,
+                !no_verify,
+                false,
+                cli.direct,
+                format,
+            )
+            .await?;
+        }
+
+        Commands::DoubleClick { id, no_verify } => {
+            run_action(
+                &id,
+                ActionRequest::DoubleClick,
+                !no_verify,
+                false,
+                cli.direct,
+                format,
+            )
+            .await?;
+        }
+
+        Commands::Hover { id, no_verify } => {
+            run_action(
+                &id,
+                ActionRequest::Hover,
+                !no_verify,
+                false,
+                cli.direct,
+                format,
+            )
+            .await?;
+        }
+
+        Commands::Drag {
+            id,
+            to_x,
+            to_y,
+            no_verify,
+        } => {
+            run_action(
+                &id,
+                ActionRequest::DragTo { to_x, to_y },
                 !no_verify,
                 false,
                 cli.direct,
@@ -420,7 +612,8 @@ async fn main() -> Result<()> {
             {
                 client.press_key(parsed).await?
             } else {
-                axdom_linux::input::send_key_combo(&parsed).await?
+                let provider = PlatformProvider::connect().await?;
+                provider.press_key(&parsed).await?
             };
             if format == OutputFormat::Json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -431,7 +624,17 @@ async fn main() -> Result<()> {
 
         Commands::Screenshot { out } => {
             if let Some(path) = out {
+                #[cfg(target_os = "linux")]
                 let (bytes, method) = axdom_linux::input::capture_screen_bytes(None).await?;
+                #[cfg(not(target_os = "linux"))]
+                let (bytes, method) = {
+                    let provider = PlatformProvider::connect().await?;
+                    let shot = provider.capture_screenshot(None).await?;
+                    (
+                        axdom_core::decode_base64(&shot.base64_data)?,
+                        shot.method_used,
+                    )
+                };
                 tokio::fs::write(&path, &bytes).await?;
                 println!(
                     "saved {} bytes to {} via {}",
@@ -445,7 +648,8 @@ async fn main() -> Result<()> {
                 {
                     client.capture_screenshot(None).await?
                 } else {
-                    axdom_linux::input::capture_screen_png(None).await?
+                    let provider = PlatformProvider::connect().await?;
+                    provider.capture_screenshot(None).await?
                 };
                 if format == OutputFormat::Json {
                     println!("{}", serde_json::to_string_pretty(&shot)?);
@@ -459,24 +663,31 @@ async fn main() -> Result<()> {
         }
 
         Commands::Watch => {
-            let provider = LinuxProvider::connect().await?;
-            let conn = provider.connection();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            #[cfg(target_os = "linux")]
+            {
+                let provider = PlatformProvider::connect().await?;
+                let conn = provider.connection();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(128);
 
-            let watcher = tokio::spawn(async move { watch_events(conn, tx).await });
+                let watcher = tokio::spawn(async move { watch_events(conn, tx).await });
 
-            while let Some(ev) = rx.recv().await {
-                if format == OutputFormat::Json {
-                    println!("{}", serde_json::to_string(&ev)?);
-                } else {
-                    println!(
-                        "[{}] {} {} ({})",
-                        ev.category, ev.kind, ev.detail, ev.source_ref
-                    );
+                while let Some(ev) = rx.recv().await {
+                    if format == OutputFormat::Json {
+                        println!("{}", serde_json::to_string(&ev)?);
+                    } else {
+                        println!(
+                            "[{}] {} {} ({})",
+                            ev.category, ev.kind, ev.detail, ev.source_ref
+                        );
+                    }
                 }
-            }
 
-            watcher.await??;
+                watcher.await??;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("`axdom watch` live event stream is currently Linux AT-SPI2 only");
+            }
         }
 
         Commands::Daemon { action } => match action {
@@ -497,23 +708,49 @@ async fn main() -> Result<()> {
                 };
                 policy.deny_apps.extend(deny_apps);
 
-                let provider = Arc::new(LinuxProvider::connect().await?);
+                let provider = Arc::new(PlatformProvider::connect().await?);
+                #[cfg(target_os = "linux")]
                 let conn = provider.connection();
                 let state = Arc::new(DaemonState::new(provider, policy));
 
-                // Background AT-SPI2 event listener invalidates the hot cache on UI mutations.
-                let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-                tokio::spawn(async move {
-                    if let Err(e) = watch_events(conn, tx).await {
-                        tracing::warn!("AT-SPI2 event watcher exited: {e}");
-                    }
-                });
-                let invalidator_state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    while let Some(_ev) = rx.recv().await {
-                        invalidator_state.invalidate().await;
-                    }
-                });
+                // Background event listener invalidates the hot cache on UI mutations.
+                #[cfg(target_os = "linux")]
+                {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+                    tokio::spawn(async move {
+                        if let Err(e) = watch_events(conn, tx).await {
+                            tracing::warn!("AT-SPI2 event watcher exited: {e}");
+                        }
+                    });
+                    let invalidator_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        while let Some(_ev) = rx.recv().await {
+                            invalidator_state.invalidate().await;
+                        }
+                    });
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+                    tokio::spawn(axdom_windows::watch_windows_events(tx));
+                    let invalidator_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        while let Some(_ev) = rx.recv().await {
+                            invalidator_state.invalidate().await;
+                        }
+                    });
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+                    tokio::spawn(axdom_macos::watch_macos_events(tx));
+                    let invalidator_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        while let Some(_ev) = rx.recv().await {
+                            invalidator_state.invalidate().await;
+                        }
+                    });
+                }
 
                 let sock_path = socket.unwrap_or_else(default_socket_path);
                 eprintln!("axdom daemon listening on {}", sock_path.display());
@@ -560,7 +797,7 @@ async fn main() -> Result<()> {
             };
             policy.deny_apps.extend(deny_apps);
 
-            let provider = Arc::new(LinuxProvider::connect().await?);
+            let provider = Arc::new(PlatformProvider::connect().await?);
             let mut server = McpServer::new(provider, policy);
             if !cli.direct {
                 server = server.with_daemon_socket(default_socket_path());
@@ -676,7 +913,7 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
-                let provider = LinuxProvider::connect().await?;
+                let provider = PlatformProvider::connect().await?;
                 let query = TreeQuery {
                     window_filter: window,
                     ..Default::default()
@@ -756,6 +993,7 @@ fn is_known_chromium_app(bin: &str) -> bool {
             | "slack"
             | "obsidian"
             | "electron"
+            | "opera"
             | "vivaldi"
             | "microsoft-edge"
     )
@@ -876,7 +1114,7 @@ async fn run_action(
         AppPolicy::default().check_write(&snapshot.window)?;
         let node_ref = find_node_ref(&snapshot, raw_id)?;
 
-        let provider = LinuxProvider::connect().await?;
+        let provider = PlatformProvider::connect().await?;
         match provider.perform_action(&node_ref, &action, verify).await {
             Ok(res) => res,
             Err(AxdomError::ActionUnsupported(_))

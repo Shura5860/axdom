@@ -1,6 +1,7 @@
 pub mod action;
 pub mod error;
 pub mod format;
+pub mod image;
 pub mod model;
 pub mod policy;
 pub mod provider;
@@ -13,6 +14,7 @@ pub use action::{
 };
 pub use error::{AxdomError, Result};
 pub use format::{OutputFormat, format_snapshot, format_windows};
+pub use image::{SomCell, annotate_som_grid, crop_png_bytes, decode_base64};
 pub use model::{
     Bounds, CheckStatus, DoctorCheck, DoctorReport, NodeRole, NodeState, PrunedNode, RawNode,
     TreeSnapshot, WindowInfo,
