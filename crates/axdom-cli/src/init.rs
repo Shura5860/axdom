@@ -14,9 +14,11 @@ struct McpClientTarget {
     name: &'static str,
     path: PathBuf,
     only_if_parent_exists: bool,
+    /// When true, only cleaned up during `--undo` (never modified on apply/dry-run).
+    undo_only: bool,
 }
 
-/// Discovers installed MCP clients (Claude Desktop, Cursor, Windsurf, Antigravity, Claude Code)
+/// Discovers installed MCP clients (Claude Desktop, Cursor, Windsurf, Antigravity)
 /// and registers or removes `mcpServers.axdom` pointing to the current `axdom` executable.
 pub fn configure_mcp_clients(exe_path: &Path, mode: InitMode) -> Result<Vec<String>> {
     let targets = discover_mcp_targets();
@@ -24,6 +26,9 @@ pub fn configure_mcp_clients(exe_path: &Path, mode: InitMode) -> Result<Vec<Stri
     let exe_str = exe_path.to_string_lossy().to_string();
 
     for target in targets {
+        if target.undo_only && mode != InitMode::Undo {
+            continue;
+        }
         let parent_exists = target.path.parent().is_some_and(Path::is_dir);
         let file_exists = target.path.is_file();
         if mode != InitMode::Undo && target.only_if_parent_exists && !parent_exists && !file_exists
@@ -86,11 +91,13 @@ fn discover_mcp_targets() -> Vec<McpClientTarget> {
         name: "Claude Desktop",
         path: claude_path,
         only_if_parent_exists: true,
+        undo_only: false,
     });
     out.push(McpClientTarget {
         name: "Cursor",
         path: home.join(".cursor").join("mcp.json"),
         only_if_parent_exists: true,
+        undo_only: false,
     });
     out.push(McpClientTarget {
         name: "Windsurf",
@@ -99,11 +106,20 @@ fn discover_mcp_targets() -> Vec<McpClientTarget> {
             .join("windsurf")
             .join("mcp_config.json"),
         only_if_parent_exists: true,
+        undo_only: false,
     });
     out.push(McpClientTarget {
         name: "Antigravity",
         path: home.join(".gemini").join("config").join("mcp_config.json"),
         only_if_parent_exists: true,
+        undo_only: false,
+    });
+    // Legacy cleanup only: never write to ~/.claude.json on apply, but clean up older entries on --undo.
+    out.push(McpClientTarget {
+        name: "Claude Code (legacy)",
+        path: home.join(".claude.json"),
+        only_if_parent_exists: true,
+        undo_only: true,
     });
 
     out
@@ -139,7 +155,8 @@ pub fn patch_mcp_json(
         if !removed {
             return Ok(None);
         }
-        std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+        let rendered = format!("{}\n", serde_json::to_string_pretty(&root)?);
+        atomic_write(path, rendered.as_bytes())?;
         return Ok(Some(format!(
             "removed MCP entry ({client_name}): {}",
             path.display()
@@ -197,10 +214,32 @@ pub fn patch_mcp_json(
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let existing_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
+
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(format!(".axdom.{}.tmp", std::process::id()));
     let tmp_path = PathBuf::from(tmp);
-    std::fs::write(&tmp_path, content)?;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = existing_perms
+            .as_ref()
+            .map(|p| p.mode() & 0o777)
+            .unwrap_or(0o600);
+        opts.mode(mode);
+    }
+    let mut file = opts.open(&tmp_path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    drop(file);
+
+    if let Some(perms) = existing_perms {
+        let _ = std::fs::set_permissions(&tmp_path, perms);
+    }
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
@@ -220,6 +259,11 @@ mod tests {
             r#"{"mcpServers":{"other":{"command":"other-bin","args":[]}}}"#,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let dry = patch_mcp_json(&cfg, "Test", "/usr/bin/axdom", InitMode::DryRun)
             .unwrap()
@@ -239,6 +283,12 @@ mod tests {
         let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert_eq!(parsed["mcpServers"]["other"]["command"], "other-bin");
         assert_eq!(parsed["mcpServers"]["axdom"]["command"], "/usr/bin/axdom");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
         let undone = patch_mcp_json(&cfg, "Test", "/usr/bin/axdom", InitMode::Undo)
             .unwrap()

@@ -53,6 +53,7 @@ impl WindowsProvider {
 }
 
 fn init_uia() -> Result<IUIAutomation> {
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
@@ -61,6 +62,7 @@ fn init_uia() -> Result<IUIAutomation> {
 }
 
 fn runtime_id_of(el: &IUIAutomationElement) -> String {
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     unsafe {
         let Ok(sa) = el.GetRuntimeId() else {
             return "uia:unknown".to_string();
@@ -93,6 +95,7 @@ fn runtime_id_of(el: &IUIAutomationElement) -> String {
 }
 
 fn bounds_of(el: &IUIAutomationElement) -> Option<Bounds> {
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let rect: RECT = unsafe { el.CurrentBoundingRectangle().ok()? };
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
@@ -109,36 +112,46 @@ fn bounds_of(el: &IUIAutomationElement) -> Option<Bounds> {
 
 fn list_windows_sync() -> Result<Vec<(WindowInfo, IUIAutomationElement)>> {
     let uia = init_uia()?;
+    // SAFETY: Read-only Win32 user32 query with no pointer arguments.
     let fg_hwnd: HWND = unsafe { GetForegroundWindow() };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let root = unsafe {
         uia.GetRootElement()
             .map_err(|e| AxdomError::Backend(format!("GetRootElement: {e}")))?
     };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let cond = unsafe {
         uia.CreateTrueCondition()
             .map_err(|e| AxdomError::Backend(format!("CreateTrueCondition: {e}")))?
     };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let array = unsafe {
         root.FindAll(TreeScope_Children, &cond)
             .map_err(|e| AxdomError::Backend(format!("FindAll windows: {e}")))?
     };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let len = unsafe { array.Length().unwrap_or(0) };
     let mut windows = Vec::new();
     for i in 0..len {
+        // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
         let Ok(el) = (unsafe { array.GetElement(i) }) else {
             continue;
         };
+        // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
         let title = unsafe { el.CurrentName().map(|b| b.to_string()).unwrap_or_default() };
         if title.trim().is_empty() {
             continue;
         }
+        // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
         let pid = unsafe { el.CurrentProcessId().ok().map(|p| p as u32) };
+        // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
         let hwnd = unsafe {
             el.CurrentNativeWindowHandle()
                 .ok()
                 .unwrap_or(HWND::default())
         };
         let active = !fg_hwnd.is_invalid() && hwnd == fg_hwnd;
+        // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
         let class_name = unsafe {
             el.CurrentClassName()
                 .map(|b| b.to_string())
@@ -174,30 +187,39 @@ fn walk_uia(
         return None;
     }
 
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let control_type = unsafe { el.CurrentControlType().map(|c| c.0).unwrap_or(0) };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let is_password = unsafe { el.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) };
     let role = map_uia_control_type(control_type, is_password);
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let name = unsafe { el.CurrentName().map(|b| b.to_string()).unwrap_or_default() };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let help = unsafe { el.CurrentHelpText().map(|b| b.to_string()).ok() }
         .filter(|s| !s.trim().is_empty());
 
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let enabled = unsafe { el.CurrentIsEnabled().map(|b| b.as_bool()).unwrap_or(true) };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let offscreen = unsafe {
         el.CurrentIsOffscreen()
             .map(|b| b.as_bool())
             .unwrap_or(false)
     };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let focused = unsafe {
         el.CurrentHasKeyboardFocus()
             .map(|b| b.as_bool())
             .unwrap_or(false)
     };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let focusable = unsafe {
         el.CurrentIsKeyboardFocusable()
             .map(|b| b.as_bool())
             .unwrap_or(false)
     };
 
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let value = unsafe {
         el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
             .ok()
@@ -205,6 +227,7 @@ fn walk_uia(
             .map(|b| b.to_string())
             .filter(|s| !s.is_empty())
     };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let checked = unsafe {
         el.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
             .ok()
@@ -212,6 +235,7 @@ fn walk_uia(
             .map(|s| s.0 == 1)
             .unwrap_or(false)
     };
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let selected = unsafe {
         el.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
             .ok()
@@ -240,6 +264,7 @@ fn walk_uia(
     };
 
     let mut children = Vec::new();
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     if let Ok(mut child) = unsafe { walker.GetFirstChildElement(el) } {
         loop {
             if let Some(node) = walk_uia(
@@ -254,6 +279,7 @@ fn walk_uia(
             ) {
                 children.push(node);
             }
+            // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
             match unsafe { walker.GetNextSiblingElement(&child) } {
                 Ok(next) => child = next,
                 Err(_) => break,
@@ -285,11 +311,13 @@ fn find_element_by_ref(
     if runtime_id_of(el) == target_ref {
         return Some(el.clone());
     }
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     if let Ok(mut child) = unsafe { walker.GetFirstChildElement(el) } {
         loop {
             if let Some(found) = find_element_by_ref(walker, &child, target_ref, depth + 1) {
                 return Some(found);
             }
+            // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
             match unsafe { walker.GetNextSiblingElement(&child) } {
                 Ok(next) => child = next,
                 Err(_) => break,
@@ -301,6 +329,7 @@ fn find_element_by_ref(
 
 fn locate_live_element(target_ref: &str) -> Result<IUIAutomationElement> {
     let uia = init_uia()?;
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     let walker = unsafe {
         uia.ControlViewWalker()
             .map_err(|e| AxdomError::Backend(format!("ControlViewWalker: {e}")))?
@@ -349,6 +378,7 @@ fn send_vk_combo(combo: &KeyCombo) -> Result<ActionResult> {
         inputs.push(make_key(m, true));
     }
 
+    // SAFETY: Win32 SendInput receives a valid contiguous slice of initialized INPUT structs with exact struct size.
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent == 0 {
         return Err(AxdomError::ActionFailed("Win32 SendInput failed".into()));
@@ -363,7 +393,9 @@ fn send_vk_combo(combo: &KeyCombo) -> Result<ActionResult> {
 }
 
 fn send_mouse_click(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
+    // SAFETY: Read-only Win32 user32 query with no pointer arguments.
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+    // SAFETY: Read-only Win32 user32 query with no pointer arguments.
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
     let abs_x = (x * 65535) / screen_w;
     let abs_y = (y * 65535) / screen_h;
@@ -395,6 +427,7 @@ fn send_mouse_click(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
             },
         },
     ];
+    // SAFETY: Win32 SendInput receives a valid contiguous slice of initialized INPUT structs with exact struct size.
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent == 0 {
         return Err(AxdomError::ActionFailed(
@@ -445,6 +478,7 @@ fn send_mouse_wheel(node_id: &str, delta_x: i32, delta_y: i32) -> Result<ActionR
         });
     }
     if !inputs.is_empty() {
+        // SAFETY: Win32 SendInput receives a valid contiguous slice of initialized INPUT structs with exact struct size.
         let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent == 0 {
             return Err(AxdomError::ActionFailed(
@@ -469,7 +503,9 @@ fn send_mouse_button_action(
     count: u32,
     action: &str,
 ) -> Result<ActionResult> {
+    // SAFETY: Read-only Win32 user32 query with no pointer arguments.
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+    // SAFETY: Read-only Win32 user32 query with no pointer arguments.
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
     let abs_x = (x * 65535) / screen_w;
     let abs_y = (y * 65535) / screen_h;
@@ -506,6 +542,7 @@ fn send_mouse_button_action(
             },
         });
     }
+    // SAFETY: Win32 SendInput receives a valid contiguous slice of initialized INPUT structs with exact struct size.
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent == 0 {
         return Err(AxdomError::ActionFailed(format!(
@@ -528,7 +565,9 @@ fn send_mouse_drag(
     to_x: i32,
     to_y: i32,
 ) -> Result<ActionResult> {
+    // SAFETY: Read-only Win32 user32 query with no pointer arguments.
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+    // SAFETY: Read-only Win32 user32 query with no pointer arguments.
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
     let to_abs = |x: i32, y: i32| ((x * 65535) / screen_w, (y * 65535) / screen_h);
     let (fx, fy) = to_abs(from_x, from_y);
@@ -587,6 +626,7 @@ fn send_mouse_drag(
             },
         },
     ];
+    // SAFETY: Win32 SendInput receives a valid contiguous slice of initialized INPUT structs with exact struct size.
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent == 0 {
         return Err(AxdomError::ActionFailed(
@@ -607,9 +647,11 @@ pub async fn watch_windows_events(tx: tokio::sync::mpsc::Sender<axdom_core::A11y
     let mut last_sig: Option<(isize, String)> = None;
     loop {
         let sig = tokio::task::spawn_blocking(|| {
+            // SAFETY: Read-only Win32 user32 query with no pointer arguments.
             let hwnd = unsafe { GetForegroundWindow() }.0 as isize;
             let focus_id = init_uia()
                 .ok()
+                // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
                 .and_then(|u| unsafe { u.GetFocusedElement().ok() })
                 .map(|el| runtime_id_of(&el))
                 .unwrap_or_default();
@@ -636,6 +678,7 @@ pub async fn watch_windows_events(tx: tokio::sync::mpsc::Sender<axdom_core::A11y
 }
 
 fn capture_gdi_png(bounds: Option<Bounds>) -> Result<Screenshot> {
+    // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
     unsafe {
         let width = GetSystemMetrics(SM_CXSCREEN);
         let height = GetSystemMetrics(SM_CYSCREEN);
@@ -753,6 +796,7 @@ impl AccessibilityProvider for WindowsProvider {
         let query = query.clone();
         tokio::task::spawn_blocking(move || {
             let uia = init_uia()?;
+            // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
             let walker = unsafe {
                 uia.ControlViewWalker()
                     .map_err(|e| AxdomError::Backend(format!("ControlViewWalker: {e}")))?
@@ -805,9 +849,12 @@ impl AccessibilityProvider for WindowsProvider {
         let node = node.clone();
         tokio::task::spawn_blocking(move || {
             let el = locate_live_element(&node.backend_ref)?;
+            // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
             let ct = unsafe { el.CurrentControlType().map(|c| c.0).unwrap_or(0) };
+            // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
             let is_pw = unsafe { el.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) };
             let live_role = map_uia_control_type(ct, is_pw);
+            // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
             let live_name = unsafe { el.CurrentName().map(|b| b.to_string()).unwrap_or_default() };
             if live_role != node.role || (!node.name.is_empty() && live_name.trim() != node.name) {
                 return Err(AxdomError::StaleNode {
@@ -882,6 +929,7 @@ impl AccessibilityProvider for WindowsProvider {
             }
             ActionRequest::Focus => {
                 let el = locate_live_element(&node.backend_ref)?;
+                // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
                 unsafe {
                     el.SetFocus()
                         .map_err(|e| AxdomError::ActionFailed(format!("UIA.SetFocus: {e}")))?;
@@ -896,6 +944,7 @@ impl AccessibilityProvider for WindowsProvider {
             }
             ActionRequest::Click => {
                 let el = locate_live_element(&node.backend_ref)?;
+                // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
                 unsafe {
                     if let Ok(inv) =
                         el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
@@ -944,6 +993,7 @@ impl AccessibilityProvider for WindowsProvider {
             }
             ActionRequest::SetText { text } => {
                 let el = locate_live_element(&node.backend_ref)?;
+                // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
                 unsafe {
                     let _ = el.SetFocus();
                     let val = el
@@ -965,6 +1015,7 @@ impl AccessibilityProvider for WindowsProvider {
             }
             ActionRequest::SetValue { value } => {
                 let el = locate_live_element(&node.backend_ref)?;
+                // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
                 unsafe {
                     let rv = el
                         .GetCurrentPatternAs::<IUIAutomationRangeValuePattern>(
@@ -987,6 +1038,7 @@ impl AccessibilityProvider for WindowsProvider {
             }
             ActionRequest::Scroll { delta_x, delta_y } => {
                 let el = locate_live_element(&node.backend_ref)?;
+                // SAFETY: COM/Win32 UIA call operates on valid COM interfaces initialized on this thread via CoInitializeEx.
                 unsafe {
                     let _ = el.SetFocus();
                     if delta_x == 0

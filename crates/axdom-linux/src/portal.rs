@@ -118,12 +118,11 @@ pub async fn send_key_via_portal(combo: &KeyCombo) -> Result<ActionResult> {
         .collect();
 
     let mut guard = shared_session().lock().await;
-    if guard.is_none() {
-        *guard = Some(open_portal_session().await?);
-    }
-
     let send_res = {
-        let sess = guard.as_ref().expect("initialized above");
+        let sess = match guard.as_ref() {
+            Some(s) => s,
+            None => guard.insert(open_portal_session().await?),
+        };
         emit_combo(&sess.conn, &sess.session_handle, &mod_syms, keysym).await
     };
 
@@ -150,12 +149,11 @@ pub async fn send_scroll_via_portal(
     delta_y: i32,
 ) -> Result<ActionResult> {
     let mut guard = shared_session().lock().await;
-    if guard.is_none() {
-        *guard = Some(open_portal_session().await?);
-    }
-
     let send_res = {
-        let sess = guard.as_ref().expect("initialized above");
+        let sess = match guard.as_ref() {
+            Some(s) => s,
+            None => guard.insert(open_portal_session().await?),
+        };
         emit_scroll(&sess.conn, &sess.session_handle, delta_x, delta_y).await
     };
 
@@ -185,12 +183,11 @@ pub async fn send_pointer_click_via_portal(
     action_name: &str,
 ) -> Result<ActionResult> {
     let mut guard = shared_session().lock().await;
-    if guard.is_none() {
-        *guard = Some(open_portal_session().await?);
-    }
-
     let send_res = {
-        let sess = guard.as_ref().expect("initialized above");
+        let sess = match guard.as_ref() {
+            Some(s) => s,
+            None => guard.insert(open_portal_session().await?),
+        };
         emit_pointer_click(&sess.conn, &sess.session_handle, x, y, button, count).await
     };
 
@@ -212,12 +209,11 @@ pub async fn send_pointer_click_via_portal(
 /// Moves the pointer to absolute `(x, y)` (hover) via XDG `RemoteDesktop` portal.
 pub async fn send_pointer_hover_via_portal(node_id: &str, x: i32, y: i32) -> Result<ActionResult> {
     let mut guard = shared_session().lock().await;
-    if guard.is_none() {
-        *guard = Some(open_portal_session().await?);
-    }
-
     let send_res = {
-        let sess = guard.as_ref().expect("initialized above");
+        let sess = match guard.as_ref() {
+            Some(s) => s,
+            None => guard.insert(open_portal_session().await?),
+        };
         emit_pointer_move(&sess.conn, &sess.session_handle, x, y).await
     };
 
@@ -245,12 +241,11 @@ pub async fn send_pointer_drag_via_portal(
     to_y: i32,
 ) -> Result<ActionResult> {
     let mut guard = shared_session().lock().await;
-    if guard.is_none() {
-        *guard = Some(open_portal_session().await?);
-    }
-
     let send_res = {
-        let sess = guard.as_ref().expect("initialized above");
+        let sess = match guard.as_ref() {
+            Some(s) => s,
+            None => guard.insert(open_portal_session().await?),
+        };
         emit_pointer_drag(&sess.conn, &sess.session_handle, from_x, from_y, to_x, to_y).await
     };
 
@@ -297,12 +292,11 @@ pub async fn type_text_via_portal(
     }
 
     let mut guard = shared_session().lock().await;
-    if guard.is_none() {
-        *guard = Some(open_portal_session().await?);
-    }
-
     let send_res = {
-        let sess = guard.as_ref().expect("initialized above");
+        let sess = match guard.as_ref() {
+            Some(s) => s,
+            None => guard.insert(open_portal_session().await?),
+        };
         emit_text(&sess.conn, &sess.session_handle, &syms, clear_existing).await
     };
 

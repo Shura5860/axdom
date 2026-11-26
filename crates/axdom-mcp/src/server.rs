@@ -356,6 +356,9 @@ impl<P: AccessibilityProvider> McpServer<P> {
             .await?;
 
         if submit {
+            // Re-verify live active window before sending Enter so a focus shift to a denied
+            // window (e.g. polkit/password manager) right after typing cannot receive Enter.
+            self.check_live_active_window_write().await?;
             let enter = KeyCombo::parse("Enter").map_err(|e| e.to_string())?;
             let key_res = if let Some(mut daemon) = self.try_daemon().await {
                 daemon.press_key(enter).await.map_err(|e| e.to_string())?
@@ -557,28 +560,39 @@ impl<P: AccessibilityProvider> McpServer<P> {
 
         let snap = self.last_snapshot.lock().await.clone();
         if full_screen {
-            // Block full-screen capture if ANY open window is denied by AppPolicy (prevents leaking
-            // a password manager or auth prompt open on a second monitor or in the background).
-            if let Ok(wins) = self.provider.list_windows().await {
-                for w in &wins {
-                    if let Err(e) = self.policy.check_read(w) {
-                        return tool_text_result(
-                            format!(
-                                "policy denied: full_screen screenshot blocked while denied window is open ({e}); crop to an allowed window instead"
-                            ),
-                            true,
-                        );
+            // Fail-closed: block full-screen capture if listing windows fails OR if ANY open window
+            // is denied by AppPolicy (prevents leaking a password manager or auth prompt).
+            match self.provider.list_windows().await {
+                Ok(wins) => {
+                    for w in &wins {
+                        if let Err(e) = self.policy.check_read(w) {
+                            return tool_text_result(
+                                format!(
+                                    "policy denied: full_screen screenshot blocked while denied window is open ({e}); crop to an allowed window instead"
+                                ),
+                                true,
+                            );
+                        }
                     }
                 }
-            }
-        }
-        if let Some(prev) = snap.as_ref() {
-            if let Err(e) = self.policy.check_read(&prev.window) {
-                return tool_text_result(e.to_string(), true);
+                Err(e) => {
+                    return tool_text_result(
+                        format!(
+                            "policy denied: cannot verify open windows for full_screen screenshot ({e})"
+                        ),
+                        true,
+                    );
+                }
             }
         } else if let Ok(wins) = self.provider.list_windows().await
             && let Some(active) = wins.iter().find(|w| w.active)
             && let Err(e) = self.policy.check_read(active)
+        {
+            // Even for cropped screenshots, refuse if the foreground (overlapping) window is denied.
+            return tool_text_result(e.to_string(), true);
+        }
+        if let Some(prev) = snap.as_ref()
+            && let Err(e) = self.policy.check_read(&prev.window)
         {
             return tool_text_result(e.to_string(), true);
         }

@@ -45,13 +45,13 @@ impl LinuxProvider {
     }
 
     pub fn connection(&self) -> Connection {
-        self.conn.read().expect("conn lock poisoned").clone()
+        self.conn.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Re-establishes the AT-SPI2 D-Bus connection (e.g. if the bus restarted).
     pub async fn reconnect(&self) -> Result<Connection> {
         let fresh = connect_a11y_bus().await?;
-        *self.conn.write().expect("conn lock poisoned") = fresh.clone();
+        *self.conn.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
         Ok(fresh)
     }
 
@@ -189,9 +189,11 @@ impl AccessibilityProvider for LinuxProvider {
                 // Prefer the active window when multiple windows match (e.g. Chromium background frames).
                 if let Some(pos) = matches.iter().position(|(w, _, _)| w.active) {
                     matches.swap_remove(pos)
-                } else {
+                } else if let Some(last) = matches.pop() {
                     // Otherwise prefer the newest (last registered) window over stale index-0 frames.
-                    matches.pop().unwrap()
+                    last
+                } else {
+                    return Err(AxdomError::WindowNotFound(filter.clone()));
                 }
             }
             None => handles

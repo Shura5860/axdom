@@ -48,11 +48,16 @@ SUMS_TMP="${TMP_DIR}/SHA256SUMS"
 echo "Downloading ${BASE_URL}/${ASSET}..."
 download "${BASE_URL}/${ASSET}" "$BIN_TMP"
 
-if download "${BASE_URL}/SHA256SUMS" "$SUMS_TMP" 2>/dev/null; then
+if [ "${AXDOM_SKIP_VERIFY:-0}" != "1" ]; then
+  echo "Downloading SHA256SUMS..."
+  if ! download "${BASE_URL}/SHA256SUMS" "$SUMS_TMP"; then
+    echo "Error: failed to download SHA256SUMS (refusing unverified install; set AXDOM_SKIP_VERIFY=1 to override)." >&2
+    exit 1
+  fi
   echo "Verifying SHA-256 checksum..."
   EXPECTED="$(grep " ${ASSET}\$" "$SUMS_TMP" | awk '{print $1}')"
   if [ -z "$EXPECTED" ]; then
-    echo "Checksum entry for ${ASSET} not found in SHA256SUMS" >&2
+    echo "Error: checksum entry for ${ASSET} not found in SHA256SUMS" >&2
     exit 1
   fi
   if command -v sha256sum >/dev/null 2>&1; then
@@ -60,16 +65,14 @@ if download "${BASE_URL}/SHA256SUMS" "$SUMS_TMP" 2>/dev/null; then
   elif command -v shasum >/dev/null 2>&1; then
     ACTUAL="$(shasum -a 256 "$BIN_TMP" | awk '{print $1}')"
   else
-    echo "sha256sum or shasum is required to verify download integrity" >&2
+    echo "Error: sha256sum or shasum is required to verify download integrity" >&2
     exit 1
   fi
   if [ "$EXPECTED" != "$ACTUAL" ]; then
-    echo "SHA-256 checksum mismatch for ${ASSET}!" >&2
+    echo "Error: SHA-256 checksum mismatch for ${ASSET}!" >&2
     exit 1
   fi
-  echo "Checksum OK."
-else
-  echo "Warning: SHA256SUMS not published for this release yet." >&2
+  echo "Checksum OK. (For provenance verification, run: gh attestation verify ${ASSET} --repo ${REPO})"
 fi
 
 mkdir -p "$INSTALL_DIR"

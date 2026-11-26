@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -64,6 +66,10 @@ jobs:
         run: |
           cd dist
           sha256sum * > SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/axdom-*
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

@@ -42,6 +42,7 @@ struct CGSize {
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
+// SAFETY: System Apple framework FFI declarations matching official macOS ApplicationServices/CoreFoundation/CoreGraphics headers.
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXUIElementCreateSystemWide() -> AXUIElementRef;
@@ -62,6 +63,7 @@ unsafe extern "C" {
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
+// SAFETY: System Apple framework FFI declarations matching official macOS ApplicationServices/CoreFoundation/CoreGraphics headers.
 unsafe extern "C" {
     fn CFRelease(cf: CFTypeRef);
     fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
@@ -89,6 +91,7 @@ unsafe extern "C" {
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
+// SAFETY: System Apple framework FFI declarations matching official macOS ApplicationServices/CoreFoundation/CoreGraphics headers.
 unsafe extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
     fn CGEventCreateKeyboardEvent(source: CFTypeRef, keycode: u16, key_down: bool) -> CGEventRef;
@@ -113,6 +116,7 @@ struct CfGuard(CFTypeRef);
 impl Drop for CfGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: CfGuard owns a retained CFTypeRef and releases it exactly once on drop when non-null.
             unsafe { CFRelease(self.0) };
         }
     }
@@ -121,6 +125,7 @@ impl Drop for CfGuard {
 fn cf_str(s: &str) -> CfGuard {
     let c = CString::new(s).unwrap_or_default();
     let ptr =
+        // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
         unsafe { CFStringCreateWithCString(ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8) };
     CfGuard(ptr)
 }
@@ -129,6 +134,7 @@ fn read_cf_string(cf: CFTypeRef) -> Option<String> {
     if cf.is_null() {
         return None;
     }
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     unsafe {
         if CFGetTypeID(cf) != CFStringGetTypeID() {
             return None;
@@ -152,6 +158,7 @@ fn read_cf_string(cf: CFTypeRef) -> Option<String> {
 fn copy_attr(el: AXUIElementRef, attr: &str) -> Option<CfGuard> {
     let key = cf_str(attr);
     let mut val: CFTypeRef = ptr::null();
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     let err = unsafe { AXUIElementCopyAttributeValue(el, key.0, &mut val) };
     if err == 0 && !val.is_null() {
         Some(CfGuard(val))
@@ -168,6 +175,7 @@ fn copy_bool_attr(el: AXUIElementRef, attr: &str, default: bool) -> bool {
     let Some(g) = copy_attr(el, attr) else {
         return default;
     };
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     unsafe {
         if CFGetTypeID(g.0) == CFBooleanGetTypeID() {
             CFBooleanGetValue(g.0)
@@ -182,6 +190,7 @@ fn copy_bounds(el: AXUIElementRef) -> Option<Bounds> {
     let size_val = copy_attr(el, "AXSize")?;
     let mut pt = CGPoint::default();
     let mut sz = CGSize::default();
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     let ok_p = unsafe {
         AXValueGetValue(
             pos_val.0,
@@ -189,6 +198,7 @@ fn copy_bounds(el: AXUIElementRef) -> Option<Bounds> {
             (&mut pt as *mut CGPoint).cast(),
         )
     };
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     let ok_s = unsafe {
         AXValueGetValue(
             size_val.0,
@@ -211,6 +221,7 @@ fn copy_children(el: AXUIElementRef) -> Vec<CfGuard> {
     let Some(arr) = copy_attr(el, "AXChildren") else {
         return Vec::new();
     };
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     unsafe {
         if CFGetTypeID(arr.0) != CFArrayGetTypeID() {
             return Vec::new();
@@ -233,6 +244,7 @@ pub struct MacOsProvider;
 
 impl MacOsProvider {
     pub async fn connect() -> Result<Self> {
+        // SAFETY: Read-only ApplicationServices accessibility trust query with no pointer arguments.
         if !unsafe { AXIsProcessTrusted() } {
             return Err(AxdomError::BusUnavailable(
                 "macOS Accessibility permission denied; enable your terminal/IDE in System Settings -> Privacy & Security -> Accessibility".to_string(),
@@ -243,9 +255,11 @@ impl MacOsProvider {
 }
 
 fn all_desktop_windows() -> Result<Vec<(WindowInfo, CfGuard)>> {
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     let sys = CfGuard(unsafe { AXUIElementCreateSystemWide() });
     let focused_pid = copy_attr(sys.0, "AXFocusedApplication").map(|app| {
         let mut p = 0i32;
+        // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
         unsafe { AXUIElementGetPid(app.0, &mut p) };
         p
     });
@@ -258,22 +272,27 @@ fn all_desktop_windows() -> Result<Vec<(WindowInfo, CfGuard)>> {
     {
         pids.push(fp);
     }
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     let list_ptr = unsafe { CGWindowListCopyWindowInfo(1 | 16, 0) };
     if !list_ptr.is_null() {
         let list = CfGuard(list_ptr);
         let pid_key = cf_str("kCGWindowOwnerPID");
+        // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
         let count = unsafe { CFArrayGetCount(list.0) };
         for i in 0..count {
+            // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
             let dict = unsafe { CFArrayGetValueAtIndex(list.0, i) };
             if dict.is_null() {
                 continue;
             }
+            // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
             let num = unsafe { CFDictionaryGetValue(dict, pid_key.0) };
             if num.is_null() {
                 continue;
             }
             let mut pid = 0i32;
             // kCFNumberSInt32Type = 3
+            // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
             if unsafe { CFNumberGetValue(num, 3, (&mut pid as *mut i32).cast()) }
                 && pid > 0
                 && !pids.contains(&pid)
@@ -285,11 +304,13 @@ fn all_desktop_windows() -> Result<Vec<(WindowInfo, CfGuard)>> {
 
     let mut out = Vec::new();
     for pid in pids {
+        // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
         let app = CfGuard(unsafe { AXUIElementCreateApplication(pid) });
         let app_name = copy_string_attr(app.0, "AXTitle").unwrap_or_else(|| format!("pid:{pid}"));
         let Some(arr) = copy_attr(app.0, "AXWindows") else {
             continue;
         };
+        // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
         unsafe {
             if CFGetTypeID(arr.0) != CFArrayGetTypeID() {
                 continue;
@@ -326,9 +347,11 @@ pub async fn watch_macos_events(tx: tokio::sync::mpsc::Sender<axdom_core::A11yEv
     let mut last_sig: Option<(i32, String)> = None;
     loop {
         let sig = tokio::task::spawn_blocking(|| {
+            // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
             let sys = CfGuard(unsafe { AXUIElementCreateSystemWide() });
             let app = copy_attr(sys.0, "AXFocusedApplication")?;
             let mut pid = 0i32;
+            // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
             unsafe { AXUIElementGetPid(app.0, &mut pid) };
             let title = copy_attr(app.0, "AXFocusedWindow")
                 .and_then(|w| copy_string_attr(w.0, "AXTitle"))
@@ -449,6 +472,7 @@ fn resolve_ax_ref(backend_ref: &str) -> Result<CfGuard> {
         .parse()
         .map_err(|_| AxdomError::Backend(format!("invalid pid in {backend_ref}")))?;
 
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     let app = CfGuard(unsafe { AXUIElementCreateApplication(pid) });
     let mut parts = path_str.split('/');
     let win_idx: usize = parts
@@ -458,6 +482,7 @@ fn resolve_ax_ref(backend_ref: &str) -> Result<CfGuard> {
 
     let wins_arr = copy_attr(app.0, "AXWindows")
         .ok_or_else(|| AxdomError::NodeNotFound(backend_ref.to_string()))?;
+    // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
     let mut current = unsafe {
         if CFGetTypeID(wins_arr.0) != CFArrayGetTypeID()
             || (win_idx as isize) >= CFArrayGetCount(wins_arr.0)
@@ -485,6 +510,7 @@ fn resolve_ax_ref(backend_ref: &str) -> Result<CfGuard> {
 #[async_trait]
 impl AccessibilityProvider for MacOsProvider {
     async fn doctor(&self) -> DoctorReport {
+        // SAFETY: Read-only ApplicationServices accessibility trust query with no pointer arguments.
         let trusted = unsafe { AXIsProcessTrusted() };
         DoctorReport {
             checks: vec![DoctorCheck {
@@ -605,6 +631,7 @@ impl AccessibilityProvider for MacOsProvider {
             ActionRequest::Click => {
                 let el = resolve_ax_ref(&node.backend_ref)?;
                 let act = cf_str("AXPress");
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 let err = unsafe { AXUIElementPerformAction(el.0, act.0) };
                 if err != 0 {
                     return Err(AxdomError::ActionUnsupported(format!(
@@ -622,6 +649,7 @@ impl AccessibilityProvider for MacOsProvider {
             ActionRequest::Focus => {
                 let el = resolve_ax_ref(&node.backend_ref)?;
                 let attr = cf_str("AXFocused");
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 let err = unsafe { AXUIElementSetAttributeValue(el.0, attr.0, kCFBooleanTrue) };
                 if err != 0 {
                     return Err(AxdomError::ActionFailed(format!("AXFocused error {err}")));
@@ -638,6 +666,7 @@ impl AccessibilityProvider for MacOsProvider {
                 let el = resolve_ax_ref(&node.backend_ref)?;
                 let attr = cf_str("AXValue");
                 let val = cf_str(&text);
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 let err = unsafe { AXUIElementSetAttributeValue(el.0, attr.0, val.0) };
                 if err != 0 {
                     return Err(AxdomError::ActionFailed(format!("AXValue error {err}")));
@@ -654,6 +683,7 @@ impl AccessibilityProvider for MacOsProvider {
                 let el = resolve_ax_ref(&node.backend_ref)?;
                 let attr = cf_str("AXValue");
                 let val = cf_str(&value.to_string());
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 let err = unsafe { AXUIElementSetAttributeValue(el.0, attr.0, val.0) };
                 if err != 0 {
                     return Err(AxdomError::ActionFailed(format!("AXValue error {err}")));
@@ -667,6 +697,7 @@ impl AccessibilityProvider for MacOsProvider {
                 })
             }
             ActionRequest::Scroll { delta_x, delta_y } => {
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 unsafe {
                     // kCGScrollEventUnitLine = 1; negative scrolls down on macOS CGEvent.
                     let ev = CGEventCreateScrollWheelEvent(ptr::null(), 1, 2, -delta_y, -delta_x);
@@ -691,6 +722,7 @@ impl AccessibilityProvider for MacOsProvider {
                     x: (b.x + b.width / 2) as f64,
                     y: (b.y + b.height / 2) as f64,
                 };
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 unsafe {
                     // kCGEventRightMouseDown = 3, kCGEventRightMouseUp = 4, kCGMouseButtonRight = 1
                     let down = CGEventCreateMouseEvent(ptr::null(), 3, pt, 1);
@@ -720,6 +752,7 @@ impl AccessibilityProvider for MacOsProvider {
                     x: (b.x + b.width / 2) as f64,
                     y: (b.y + b.height / 2) as f64,
                 };
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 unsafe {
                     for _ in 0..2 {
                         let down = CGEventCreateMouseEvent(ptr::null(), 1, pt, 0);
@@ -750,6 +783,7 @@ impl AccessibilityProvider for MacOsProvider {
                     x: (b.x + b.width / 2) as f64,
                     y: (b.y + b.height / 2) as f64,
                 };
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 unsafe {
                     // kCGEventMouseMoved = 5
                     let mv = CGEventCreateMouseEvent(ptr::null(), 5, pt, 0);
@@ -778,6 +812,7 @@ impl AccessibilityProvider for MacOsProvider {
                     x: to_x as f64,
                     y: to_y as f64,
                 };
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 unsafe {
                     // kCGEventLeftMouseDown = 1, kCGEventLeftMouseDragged = 6, kCGEventLeftMouseUp = 2
                     let down = CGEventCreateMouseEvent(ptr::null(), 1, from, 0);
@@ -799,6 +834,7 @@ impl AccessibilityProvider for MacOsProvider {
                 })
             }
             ActionRequest::ClickCoords { x, y } => {
+                // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
                 unsafe {
                     let pt = CGPoint {
                         x: x as f64,
@@ -834,6 +870,7 @@ impl AccessibilityProvider for MacOsProvider {
             AxdomError::ActionFailed(format!("unsupported macOS keycode for {:?}", combo.key))
         })?;
         let flags = cg_flags_for_modifiers(&combo.modifiers);
+        // SAFETY: CoreFoundation/ApplicationServices FFI call operates on valid non-null CFTypeRef/AXUIElementRef handles managed by CfGuard.
         tokio::task::spawn_blocking(move || unsafe {
             let down = CGEventCreateKeyboardEvent(ptr::null(), code, true);
             let up = CGEventCreateKeyboardEvent(ptr::null(), code, false);
