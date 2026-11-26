@@ -9,4 +9,3 @@ description = "macOS Accessibility (AXUIElement) backend for axdom"
 axdom-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-tracing.workspace = true

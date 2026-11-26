@@ -45,7 +45,7 @@ pub struct WindowsProvider;
 
 impl WindowsProvider {
     pub async fn connect() -> Result<Self> {
-        tokio::task::spawn_blocking(init_uia)
+        tokio::task::spawn_blocking(|| init_uia().map(|_| ()))
             .await
             .map_err(|e| AxdomError::Backend(format!("join UIA init: {e}")))??;
         Ok(Self)
@@ -68,10 +68,8 @@ fn runtime_id_of(el: &IUIAutomationElement) -> String {
         if sa.is_null() {
             return "uia:unknown".to_string();
         }
-        let mut lbound = 0i32;
-        let mut ubound = -1i32;
-        let _ = windows::Win32::System::Ole::SafeArrayGetLBound(sa, 1, &mut lbound);
-        let _ = windows::Win32::System::Ole::SafeArrayGetUBound(sa, 1, &mut ubound);
+        let lbound = windows::Win32::System::Ole::SafeArrayGetLBound(sa, 1).unwrap_or(0);
+        let ubound = windows::Win32::System::Ole::SafeArrayGetUBound(sa, 1).unwrap_or(-1);
         let mut ids = Vec::new();
         for idx in lbound..=ubound {
             let mut val = 0i32;
@@ -714,11 +712,12 @@ fn capture_gdi_png(bounds: Option<Bounds>) -> Result<Screenshot> {
 #[async_trait]
 impl AccessibilityProvider for WindowsProvider {
     async fn doctor(&self) -> DoctorReport {
-        let check = match tokio::task::spawn_blocking(list_windows_sync).await {
-            Ok(Ok(wins)) => DoctorCheck {
+        let check = match tokio::task::spawn_blocking(|| list_windows_sync().map(|w| w.len())).await
+        {
+            Ok(Ok(count)) => DoctorCheck {
                 name: "windows_uia".to_string(),
                 status: CheckStatus::Ok,
-                detail: format!("UI Automation active ({} top-level windows)", wins.len()),
+                detail: format!("UI Automation active ({count} top-level windows)"),
                 hint: None,
             },
             Ok(Err(e)) => DoctorCheck {
