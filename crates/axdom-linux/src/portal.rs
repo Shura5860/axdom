@@ -670,7 +670,20 @@ fn load_restore_token() -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Revokes the cached XDG RemoteDesktop `restore_token` so future sessions will prompt again.
+pub fn revoke_restore_token() -> std::io::Result<bool> {
+    let Some(path) = portal_token_path() else {
+        return Ok(false);
+    };
+    if path.is_file() {
+        std::fs::remove_file(&path)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn save_restore_token(token: &str) {
+    use std::io::Write;
     let Some(path) = portal_token_path() else {
         return;
     };
@@ -682,12 +695,15 @@ fn save_restore_token(token: &str) {
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
-    if std::fs::write(&path, format!("{}\n", token.trim())).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut file) = opts.open(&path) {
+        let _ = writeln!(file, "{}", token.trim());
     }
 }
 

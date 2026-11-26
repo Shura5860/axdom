@@ -34,9 +34,14 @@ pub fn configure_mcp_clients(exe_path: &Path, mode: InitMode) -> Result<Vec<Stri
             continue;
         }
 
-        let action = patch_mcp_json(&target.path, target.name, &exe_str, mode)?;
-        if let Some(msg) = action {
-            actions.push(msg);
+        match patch_mcp_json(&target.path, target.name, &exe_str, mode) {
+            Ok(Some(msg)) => actions.push(msg),
+            Ok(None) => {}
+            Err(e) => actions.push(format!(
+                "skipped ({}): {} ({e})",
+                target.name,
+                target.path.display()
+            )),
         }
     }
 
@@ -98,11 +103,6 @@ fn discover_mcp_targets() -> Vec<McpClientTarget> {
     out.push(McpClientTarget {
         name: "Antigravity",
         path: home.join(".gemini").join("config").join("mcp_config.json"),
-        only_if_parent_exists: true,
-    });
-    out.push(McpClientTarget {
-        name: "Claude Code",
-        path: home.join(".claude.json"),
         only_if_parent_exists: true,
     });
 
@@ -188,11 +188,21 @@ pub fn patch_mcp_json(
         map.insert("axdom".to_string(), desired);
     }
 
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+    let rendered = format!("{}\n", serde_json::to_string_pretty(&root)?);
+    atomic_write(path, rendered.as_bytes())?;
     Ok(Some(format!(
         "configured ({client_name}): {}",
         path.display()
     )))
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".axdom.{}.tmp", std::process::id()));
+    let tmp_path = PathBuf::from(tmp);
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 #[cfg(test)]

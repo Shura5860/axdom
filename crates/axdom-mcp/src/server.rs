@@ -250,6 +250,14 @@ impl<P: AccessibilityProvider> McpServer<P> {
             .check_write(&probe_win)
             .map_err(|e| e.to_string())?;
 
+        // Prevent arbitrary command/shell execution (e.g. `sh -c ...`) via prompt injection
+        // unless the operator explicitly opted into `--allow-launch-any`.
+        if !self.policy.allow_launch_any && !is_allowed_desktop_launcher(app) {
+            return Err(format!(
+                "policy denied: '{app}' is not a known desktop application (arbitrary command execution is disabled by default; start axdom mcp with --allow-launch-any to override)"
+            ));
+        }
+
         let mut launch_args: Vec<String> = args
             .get("args")
             .and_then(Value::as_array)
@@ -456,18 +464,35 @@ impl<P: AccessibilityProvider> McpServer<P> {
         .await
     }
 
-    async fn tool_click_coords(&self, args: &Value) -> Result<String, String> {
+    /// Verifies that the *live* currently active window is permitted for write actions.
+    /// Fails closed if a denied window (e.g. KeePassXC, polkit) is focused or no active window is known.
+    async fn check_live_active_window_write(&self) -> Result<(), String> {
         if self.policy.read_only {
             return Err(
-                "policy denied: axdom is running in read-only mode; click_coords is disabled"
+                "policy denied: axdom is running in read-only mode; write actions are disabled"
                     .to_string(),
             );
+        }
+        if let Ok(wins) = self.provider.list_windows().await
+            && let Some(active) = wins.iter().find(|w| w.active)
+        {
+            self.policy.check_write(active).map_err(|e| e.to_string())?;
+            return Ok(());
         }
         if let Some(prev) = self.last_snapshot.lock().await.as_ref() {
             self.policy
                 .check_write(&prev.window)
                 .map_err(|e| e.to_string())?;
+            return Ok(());
         }
+        Err(
+            "policy denied: cannot verify active window for write action; call get_desktop_tree first"
+                .to_string(),
+        )
+    }
+
+    async fn tool_click_coords(&self, args: &Value) -> Result<String, String> {
+        self.check_live_active_window_write().await?;
         let x = args
             .get("x")
             .and_then(Value::as_i64)
@@ -531,6 +556,22 @@ impl<P: AccessibilityProvider> McpServer<P> {
         let node_id = args.get("node_id").and_then(Value::as_str);
 
         let snap = self.last_snapshot.lock().await.clone();
+        if full_screen {
+            // Block full-screen capture if ANY open window is denied by AppPolicy (prevents leaking
+            // a password manager or auth prompt open on a second monitor or in the background).
+            if let Ok(wins) = self.provider.list_windows().await {
+                for w in &wins {
+                    if let Err(e) = self.policy.check_read(w) {
+                        return tool_text_result(
+                            format!(
+                                "policy denied: full_screen screenshot blocked while denied window is open ({e}); crop to an allowed window instead"
+                            ),
+                            true,
+                        );
+                    }
+                }
+            }
+        }
         if let Some(prev) = snap.as_ref() {
             if let Err(e) = self.policy.check_read(&prev.window) {
                 return tool_text_result(e.to_string(), true);
@@ -640,17 +681,7 @@ impl<P: AccessibilityProvider> McpServer<P> {
     }
 
     async fn tool_press_key(&self, args: &Value) -> Result<String, String> {
-        if self.policy.read_only {
-            return Err(
-                "policy denied: axdom is running in read-only mode; press_key is disabled"
-                    .to_string(),
-            );
-        }
-        if let Some(prev) = self.last_snapshot.lock().await.as_ref() {
-            self.policy
-                .check_write(&prev.window)
-                .map_err(|e| e.to_string())?;
-        }
+        self.check_live_active_window_write().await?;
         let key_str = require_str(args, "key")?;
         let combo = KeyCombo::parse(key_str).map_err(|e| e.to_string())?;
         let result = self
@@ -1057,6 +1088,56 @@ fn tool_definitions() -> Value {
     ])
 }
 
+/// Allowlist of known GUI desktop applications that `launch_app` may start without `--allow-launch-any`.
+/// Rejects arbitrary paths, shells (`sh`, `bash`, `python`, `curl`), and command-line utilities.
+fn is_allowed_desktop_launcher(app: &str) -> bool {
+    if app.contains('/') || app.contains('\\') {
+        return false;
+    }
+    matches!(
+        app.to_lowercase().as_str(),
+        "brave"
+            | "brave-browser"
+            | "chromium"
+            | "chromium-browser"
+            | "chrome"
+            | "google-chrome"
+            | "google-chrome-stable"
+            | "firefox"
+            | "opera"
+            | "vivaldi"
+            | "microsoft-edge"
+            | "code"
+            | "vscode"
+            | "code-insiders"
+            | "konsole"
+            | "dolphin"
+            | "nautilus"
+            | "thunar"
+            | "libreoffice"
+            | "soffice"
+            | "kcalc"
+            | "gnome-calculator"
+            | "discover"
+            | "plasma-discover"
+            | "obsidian"
+            | "discord"
+            | "slack"
+            | "spotify"
+            | "steam"
+            | "gimp"
+            | "inkscape"
+            | "blender"
+            | "vlc"
+            | "okular"
+            | "evince"
+            | "kate"
+            | "gedit"
+            | "notepad"
+            | "calc"
+    )
+}
+
 fn is_chromium_binary(bin: &str) -> bool {
     let base = std::path::Path::new(bin)
         .file_name()
@@ -1443,6 +1524,55 @@ mod tests {
                 .unwrap()
                 .contains("policy denied")
         );
+
+        // Policy bypass regression #1: arbitrary shell via launch_app must be blocked by default.
+        let shell_resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(3)),
+                method: "tools/call".into(),
+                params: Some(json!({
+                    "name": "launch_app",
+                    "arguments": { "app": "sh", "args": ["-c", "echo pwned"] }
+                })),
+            })
+            .await
+            .unwrap();
+        let shell_res = shell_resp.result.unwrap();
+        assert_eq!(shell_res["isError"], true);
+        assert!(
+            shell_res["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("policy denied")
+        );
+
+        // Policy bypass regression #2: press_key and click_coords BEFORE get_desktop_tree
+        // must still check the live active window (keepassxc) and deny.
+        for (req_id, tool, args) in [
+            (4, "press_key", json!({ "key": "Enter" })),
+            (5, "click_coords", json!({ "x": 50, "y": 50 })),
+            (6, "capture_screenshot", json!({ "full_screen": true })),
+        ] {
+            let r = server
+                .handle_request(JsonRpcRequest {
+                    jsonrpc: "2.0".into(),
+                    id: Some(json!(req_id)),
+                    method: "tools/call".into(),
+                    params: Some(json!({ "name": tool, "arguments": args })),
+                })
+                .await
+                .unwrap();
+            let res = r.result.unwrap();
+            assert_eq!(res["isError"], true, "{tool} must be blocked on keepassxc");
+            assert!(
+                res["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("policy denied"),
+                "{tool} must report policy denied"
+            );
+        }
     }
 
     #[tokio::test]

@@ -29,6 +29,9 @@ pub struct AppPolicy {
     pub deny_apps: Vec<String>,
     pub allow_apps: Vec<String>,
     pub read_only: bool,
+    /// When false (default), `launch_app` only permits known desktop GUI apps or `.desktop` launchers
+    /// and blocks arbitrary shells/binaries (e.g. `sh`, `bash`, `python`).
+    pub allow_launch_any: bool,
 }
 
 impl Default for AppPolicy {
@@ -37,6 +40,7 @@ impl Default for AppPolicy {
             deny_apps: DEFAULT_DENY_APPS.iter().map(|s| (*s).to_string()).collect(),
             allow_apps: Vec::new(),
             read_only: false,
+            allow_launch_any: false,
         }
     }
 }
@@ -122,6 +126,7 @@ mod tests {
             deny_apps: vec![],
             allow_apps: vec!["firefox".into()],
             read_only: true,
+            allow_launch_any: false,
         };
         assert!(policy.check_read(&win("firefox", "Home")).is_ok());
         assert!(policy.check_write(&win("firefox", "Home")).is_err());

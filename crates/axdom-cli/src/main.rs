@@ -88,6 +88,9 @@ enum Commands {
         undo: bool,
     },
 
+    /// Revoke saved XDG RemoteDesktop portal restore token so future input prompts again.
+    Revoke,
+
     /// One-time Linux setup: configure environment.d, Chromium/Electron/Flatpak flags, and .desktop overrides.
     Setup {
         /// Preview changes without modifying any files or Flatpak overrides.
@@ -278,6 +281,10 @@ enum Commands {
         #[arg(long)]
         read_only: bool,
 
+        /// Allow `launch_app` to execute arbitrary binaries/paths (disabled by default for prompt-injection safety).
+        #[arg(long)]
+        allow_launch_any: bool,
+
         /// Enable org.a11y.Status IsEnabled & ScreenReaderEnabled on startup.
         #[arg(long)]
         enable_a11y: bool,
@@ -396,6 +403,18 @@ async fn main() -> Result<()> {
                         "Ready. Restart your MCP client (Claude/Cursor/Antigravity) to start using axdom."
                     );
                 }
+            }
+        }
+
+        Commands::Revoke => {
+            #[cfg(target_os = "linux")]
+            let removed = axdom_linux::portal::revoke_restore_token()?;
+            #[cfg(not(target_os = "linux"))]
+            let removed = false;
+            if removed {
+                println!("Revoked saved XDG RemoteDesktop portal restore token.");
+            } else {
+                println!("No saved portal restore token found.");
             }
         }
 
@@ -862,6 +881,7 @@ async fn main() -> Result<()> {
             allow_apps,
             deny_apps,
             read_only,
+            allow_launch_any,
             enable_a11y,
         } => {
             if enable_a11y {
@@ -870,6 +890,7 @@ async fn main() -> Result<()> {
             let mut policy = AppPolicy {
                 allow_apps,
                 read_only,
+                allow_launch_any,
                 ..Default::default()
             };
             policy.deny_apps.extend(deny_apps);
