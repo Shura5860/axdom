@@ -193,7 +193,13 @@ impl Pruner {
             None
         };
 
-        let value = sanitize_value(&node.role, node.value.as_deref(), self.config.max_value_len);
+        let value = sanitize_value(
+            &node.role,
+            effective_name,
+            node.description.as_deref(),
+            node.value.as_deref(),
+            self.config.max_value_len,
+        );
         let states = node
             .state
             .active_tags()
@@ -245,8 +251,43 @@ fn blind_spot_message(app_name: &str, title: &str) -> String {
         .to_string()
 }
 
-fn sanitize_value(role: &NodeRole, value: Option<&str>, max_len: usize) -> Option<String> {
-    if matches!(role, NodeRole::PasswordInput) {
+const SENSITIVE_FIELD_KEYWORDS: &[&str] = &[
+    "password",
+    "passphrase",
+    "parola",
+    "şifre",
+    "sifre",
+    "cvv",
+    "cvc",
+    "pin code",
+    "api key",
+    "secret key",
+    "access token",
+    "private key",
+];
+
+fn looks_like_sensitive_field(role: &NodeRole, name: &str, description: Option<&str>) -> bool {
+    if !matches!(role, NodeRole::Input | NodeRole::ComboBox) {
+        return false;
+    }
+    let hay = format!(
+        "{} {}",
+        name.to_lowercase(),
+        description.unwrap_or("").to_lowercase()
+    );
+    SENSITIVE_FIELD_KEYWORDS.iter().any(|kw| hay.contains(kw))
+}
+
+fn sanitize_value(
+    role: &NodeRole,
+    name: &str,
+    description: Option<&str>,
+    value: Option<&str>,
+    max_len: usize,
+) -> Option<String> {
+    if matches!(role, NodeRole::PasswordInput)
+        || looks_like_sensitive_field(role, name, description)
+    {
         return Some(REDACTED_VALUE.to_string());
     }
     let raw = value?.trim();

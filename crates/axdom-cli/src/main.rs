@@ -19,7 +19,7 @@ use axdom_linux::doctor::run_doctor;
 #[cfg(target_os = "linux")]
 use axdom_linux::events::watch_events;
 #[cfg(target_os = "linux")]
-use axdom_linux::setup::run_full_setup;
+use axdom_linux::setup::{SetupMode, run_full_setup, run_setup};
 #[cfg(target_os = "macos")]
 use axdom_macos::MacOsProvider as PlatformProvider;
 use axdom_mcp::{McpServer, serve_stdio};
@@ -76,7 +76,15 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// One-time Linux setup: configure environment.d, Chromium/Electron/Flatpak flags, and .desktop overrides.
-    Setup,
+    Setup {
+        /// Preview changes without modifying any files or Flatpak overrides.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Revert changes previously made by `axdom setup` (restoring backups when present).
+        #[arg(long)]
+        undo: bool,
+    },
 
     /// Check Linux AT-SPI2 bus, display session, and accessibility flags.
     Doctor {
@@ -339,18 +347,35 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::Setup => {
-            let _ = enable_a11y_if_needed(true).await;
-            let actions = run_full_setup().await?;
+        Commands::Setup { dry_run, undo } => {
+            #[cfg(target_os = "linux")]
+            let actions = {
+                let mode = if undo {
+                    SetupMode::Undo
+                } else if dry_run {
+                    SetupMode::DryRun
+                } else {
+                    let _ = enable_a11y_if_needed(true).await;
+                    SetupMode::Apply
+                };
+                run_setup(mode).await?
+            };
+            #[cfg(not(target_os = "linux"))]
+            let actions = {
+                let _ = (dry_run, undo);
+                run_full_setup().await?
+            };
             if format == OutputFormat::Json {
                 println!("{}", serde_json::to_string_pretty(&actions)?);
             } else {
                 for act in &actions {
                     println!("[SETUP] {act}");
                 }
-                println!(
-                    "Done. Fully restart any open Chromium/Electron/Brave apps (Ctrl+Q) for flags to take effect."
-                );
+                if !dry_run && !undo {
+                    println!(
+                        "Done. Fully restart any open Chromium/Electron/Brave apps (Ctrl+Q) for flags to take effect."
+                    );
+                }
             }
         }
 

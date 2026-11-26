@@ -61,7 +61,10 @@ impl KeyCombo {
             }
         }
 
-        let key = parts.last().unwrap().to_string();
+        let key = parts
+            .last()
+            .ok_or_else(|| AxdomError::ActionFailed("empty key combination".to_string()))?
+            .to_string();
         Ok(Self { modifiers, key })
     }
 }

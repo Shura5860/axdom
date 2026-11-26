@@ -5,11 +5,20 @@ use axdom_core::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Default Unix domain socket path: `$XDG_RUNTIME_DIR/axdom/axdom.sock` or `/tmp/axdom.sock`.
+/// Default Unix domain socket path: `$XDG_RUNTIME_DIR/axdom/axdom.sock`,
+/// falling back to `$HOME/.cache/axdom/axdom.sock` (never shared `/tmp/axdom.sock`).
 pub fn default_socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|dir| PathBuf::from(dir).join("axdom").join("axdom.sock"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/axdom.sock"))
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("axdom").join("axdom.sock");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("axdom")
+            .join("axdom.sock");
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "local".to_string());
+    PathBuf::from(format!("/tmp/axdom-{user}")).join("axdom.sock")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

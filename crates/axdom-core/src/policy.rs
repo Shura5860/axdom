@@ -2,14 +2,25 @@ use crate::error::{AxdomError, Result};
 use crate::model::WindowInfo;
 
 /// Default sensitive applications blocked from agent inspection and control.
+/// Covers password managers, authentication agents, private browser windows, and encrypted messengers.
 pub const DEFAULT_DENY_APPS: &[&str] = &[
     "keepassxc",
+    "org.keepassxc.keepassxc",
     "1password",
     "bitwarden",
+    "com.bitwarden.desktop",
     "polkit",
     "gnome-keyring",
     "kwallet",
     "gpg-agent",
+    "pinentry",
+    "signal",
+    "org.signal.signal",
+    "telegram",
+    "org.telegram.desktop",
+    "incognito",
+    "inprivate",
+    "private browsing",
 ];
 
 /// Security policy governing which desktop applications an AI agent may read or control.

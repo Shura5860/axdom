@@ -28,7 +28,7 @@ Your OS already maintains a live structured UI tree for screen readers. `axdom` 
 | **Password fields** | Visible if unmasked on screen | Redacted to `[REDACTED]` in core |
 | **UI shift safety** | Clicks wrong `(x, y)` silently | Live role/name check (`StaleNode`) |
 
-*(Measured on KDE Plasma 6 / Wayland, debug build, Konsole window. Large Electron/browser trees are slower on cold reads.)*
+*(Live latency measured on KDE Plasma 6 / Wayland, Konsole window. Release-build synthetic benchmark on a 4,201-node noisy tree: **1.18 ms avg** (`1.08 ms` min), pruning 1.41 MB raw JSON down to 6.7 KB compact DOM — **209× smaller**. Large live Electron/browser trees are slower on cold reads.)*
 
 ---
 
@@ -167,10 +167,14 @@ Every command supports `--json` and `--direct`.
 
 ## Security & Guardrails
 
-- **Automatic password redaction:** `PasswordInput` values are replaced with `[REDACTED]` in `axdom-core` before serialization.
-- **Default denylist (`AppPolicy`):** `keepassxc`, `1password`, `bitwarden`, `polkit`, `gnome-keyring`, `kwallet`, and `gpg-agent` are blocked by default.
+- **Automatic secret redaction:** `PasswordInput` nodes and input fields with sensitive labels (`password`, `parola`, `cvv`, `api key`, `secret key`, `access token`, etc.) are replaced with `[REDACTED]` in `axdom-core` before serialization. *(Note: apps that misreport both role and label cannot be guaranteed 100% masked — use `--allow-app` for strict scoping.)*
+- **Hardened local daemon socket:** Unix sockets are bound inside a `0700` user-private directory with mode `0600`, symlink/live-daemon collision checks, and per-connection `peer_cred` UID verification.
+- **Default denylist (`AppPolicy`):** Password managers (`keepassxc`, `1password`, `bitwarden`, Flatpak IDs), auth agents (`polkit`, `gnome-keyring`, `kwallet`, `gpg-agent`, `pinentry`), private browser windows (`incognito`, `inprivate`, `private browsing`), and encrypted messengers (`signal`, `telegram`) are blocked by default.
 - **Strict `#id` targeting (anti-hallucination):** Actions require the exact short `#xxx` ID from a snapshot. Passing a button label like `axdom click Find` is rejected (with a `#id` hint) so LLM agents cannot blindly guess UI controls without reading the tree first.
 - **Live stale-node check:** Before clicking or typing, `axdom` verifies the live node's role and label still match the snapshot.
+- **Reversible Linux setup:** `axdom setup` supports `--dry-run`, creates `.axdom.bak` backups before modifying existing files, and can be reverted with `axdom setup --undo`.
+
+See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ---
 
@@ -180,9 +184,9 @@ The core engine (`axdom-core`, `axdom-mcp`) is already **OS-agnostic** — tree 
 
 | Platform | Accessibility Backend | Daemon Transport | Status |
 |---|---|---|---|
-| **Linux** (Wayland & X11) | `axdom-linux` (AT-SPI2 via `zbus` + XDG Portals) | Unix domain socket | Tested on KDE Plasma 6 Wayland |
-| **Windows** | `axdom-windows` (UI Automation + Win32 `SendInput`/GDI) | Windows Named Pipe (`\\.\pipe\axdom-daemon`) | Implemented (CI-verified) |
-| **macOS** | `axdom-macos` (`AXUIElement` + `CGWindowList` + `CGEvent`) | Unix domain socket | Implemented (CI-verified) |
+| **Linux** (Wayland & X11) | `axdom-linux` (AT-SPI2 via `zbus` + XDG Portals) | Unix domain socket (`0600` + `peer_cred`) | Tested on KDE Plasma 6 Wayland |
+| **Windows** | `axdom-windows` (UI Automation + Win32 `SendInput`/GDI) | Windows Named Pipe (`\\.\pipe\axdom-daemon`) | Experimental (CI-verified) |
+| **macOS** | `axdom-macos` (`AXUIElement` + `CGWindowList` + `CGEvent`) | Unix domain socket (`0600` + `peer_cred`) | Experimental (CI-verified) |
 
 ### Known Limitations
 
@@ -252,9 +256,9 @@ axdom daemon start --enable-a11y  # ~4 ms sıcak önbellekli yerel daemon
 
 ### Platform Durumu
 
-- **Linux (`axdom-linux`):** AT-SPI2 (`zbus`) + XDG Desktop Portal (`RemoteDesktop` / `Screenshot`) + Unix soket daemon. KDE Plasma 6 Wayland üzerinde canlı test edildi.
-- **Windows (`axdom-windows`):** Windows UI Automation + Win32 `SendInput`/GDI + Named Pipe daemon (`\\.\pipe\axdom-daemon`). Eklendi ve GitHub Actions CI ile derleniyor.
-- **macOS (`axdom-macos`):** `AXUIElement` + `CGWindowListCopyWindowInfo` + `CGEvent` + Unix soket daemon. Eklendi ve GitHub Actions CI ile derleniyor.
+- **Linux (`axdom-linux`):** AT-SPI2 (`zbus`) + XDG Desktop Portal (`RemoteDesktop` / `Screenshot`) + `0600`/`peer_cred` korumalı Unix soket daemon. KDE Plasma 6 Wayland üzerinde canlı test edildi.
+- **Windows (`axdom-windows`):** Windows UI Automation + Win32 `SendInput`/GDI + Named Pipe daemon (`\\.\pipe\axdom-daemon`). **Deneysel** (GitHub Actions CI'da derlenip test ediliyor).
+- **macOS (`axdom-macos`):** `AXUIElement` + `CGWindowListCopyWindowInfo` + `CGEvent` + Unix soket daemon. **Deneysel** (GitHub Actions CI'da derlenip test ediliyor).
 
 ### Lisans
 

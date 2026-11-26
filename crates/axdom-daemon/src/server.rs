@@ -347,21 +347,47 @@ impl<P: AccessibilityProvider> DaemonState<P> {
     }
 }
 
-/// Binds a Unix domain socket and serves newline-delimited JSON `DaemonRequest`s,
-/// cleaning up the socket file cleanly on `SIGINT` / `SIGTERM`.
+/// Binds a Unix domain socket with strict `0700`/`0600` permissions, symlink protection,
+/// live-daemon collision detection, and `peer_cred` UID verification on every connection.
 pub async fn serve_unix<P: AccessibilityProvider + 'static>(
     socket_path: &Path,
     state: Arc<DaemonState<P>>,
 ) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(socket_path);
+
+    if let Ok(meta) = std::fs::symlink_metadata(socket_path) {
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing to bind over symlink at {}", socket_path.display()),
+            ));
+        }
+        // Check if another live daemon is already listening before removing the socket file.
+        if UnixStream::connect(socket_path).await.is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "another axdom daemon is already listening on {}",
+                    socket_path.display()
+                ),
+            ));
+        }
+        std::fs::remove_file(socket_path)?;
     }
 
     let listener = UnixListener::bind(socket_path)?;
-    tracing::info!("axdom daemon listening on {}", socket_path.display());
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    let expected_uid = std::fs::symlink_metadata(socket_path)?.uid();
+    tracing::info!(
+        "axdom daemon listening on {} (mode 0600, uid {})",
+        socket_path.display(),
+        expected_uid
+    );
 
     let shutdown = async {
         #[cfg(unix)]
@@ -395,6 +421,21 @@ pub async fn serve_unix<P: AccessibilityProvider + 'static>(
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                match stream.peer_cred() {
+                    Ok(cred) if cred.uid() == expected_uid => {}
+                    Ok(cred) => {
+                        tracing::warn!(
+                            "rejected daemon connection from uid {} (expected {})",
+                            cred.uid(),
+                            expected_uid
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("rejected daemon connection (peer_cred failed: {e})");
+                        continue;
+                    }
+                }
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, state).await {
