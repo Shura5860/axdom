@@ -89,7 +89,7 @@ mod non_unix {
 
         pub async fn status(&mut self) -> Result<DaemonStatus> {
             match self.send(&DaemonRequest::Status).await? {
-                DaemonResponse::Status(s) => Ok(s),
+                DaemonResponse::Status { info } => Ok(info),
                 DaemonResponse::Error { message } => Err(AxdomError::Backend(message)),
                 other => Err(AxdomError::Backend(format!(
                     "unexpected daemon response: {other:?}"
@@ -137,16 +137,16 @@ mod non_unix {
             node_id: &str,
             action: ActionRequest,
             verify: bool,
-            allow_coord_fallback: bool,
+            allow_fallback: bool,
         ) -> Result<ActionResult> {
             let req = DaemonRequest::PerformAction {
                 node_id: node_id.to_string(),
                 action,
                 verify,
-                allow_coord_fallback,
+                allow_fallback,
             };
             match self.send(&req).await? {
-                DaemonResponse::Action(res) => Ok(res),
+                DaemonResponse::Action { result } => Ok(result),
                 DaemonResponse::Error { message } => Err(AxdomError::ActionFailed(message)),
                 other => Err(AxdomError::Backend(format!(
                     "unexpected daemon response: {other:?}"
@@ -156,7 +156,7 @@ mod non_unix {
 
         pub async fn press_key(&mut self, combo: KeyCombo) -> Result<ActionResult> {
             match self.send(&DaemonRequest::PressKey { combo }).await? {
-                DaemonResponse::Action(res) => Ok(res),
+                DaemonResponse::Action { result } => Ok(result),
                 DaemonResponse::Error { message } => Err(AxdomError::ActionFailed(message)),
                 other => Err(AxdomError::Backend(format!(
                     "unexpected daemon response: {other:?}"
@@ -169,7 +169,7 @@ mod non_unix {
                 .send(&DaemonRequest::CaptureScreenshot { bounds })
                 .await?
             {
-                DaemonResponse::Screenshot(shot) => Ok(shot),
+                DaemonResponse::Screenshot { screenshot } => Ok(screenshot),
                 DaemonResponse::Error { message } => Err(AxdomError::ActionFailed(message)),
                 other => Err(AxdomError::Backend(format!(
                     "unexpected daemon response: {other:?}"
@@ -229,26 +229,30 @@ mod non_unix {
                             break;
                         }
                         let resp = match serde_json::from_str::<DaemonRequest>(&line) {
+                            Ok(DaemonRequest::Ping) => DaemonResponse::Pong,
                             Ok(DaemonRequest::Status) => {
                                 let guard = st.last_snapshot.read().await;
-                                DaemonResponse::Status(DaemonStatus {
-                                    pid: std::process::id(),
-                                    cache_hits: st
-                                        .cache_hits
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                    cache_misses: st
-                                        .cache_misses
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                    invalidations: st
-                                        .invalidations
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                    cached_window: guard
-                                        .as_ref()
-                                        .map(|(s, _, _)| s.window.title.clone()),
-                                    cached_snapshot_id: guard
-                                        .as_ref()
-                                        .map(|(s, _, _)| s.snapshot_id),
-                                })
+                                DaemonResponse::Status {
+                                    info: DaemonStatus {
+                                        pid: std::process::id(),
+                                        cache_hits: st
+                                            .cache_hits
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                        cache_misses: st
+                                            .cache_misses
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                        invalidations: st
+                                            .invalidations
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                        cache_dirty: guard.is_none(),
+                                        cached_window: guard
+                                            .as_ref()
+                                            .map(|(s, _, _)| s.window.title.clone()),
+                                        cached_snapshot_id: guard
+                                            .as_ref()
+                                            .map(|(s, _, _)| s.snapshot_id),
+                                    },
+                                }
                             }
                             Ok(DaemonRequest::Invalidate) => {
                                 st.invalidate().await;
@@ -348,7 +352,7 @@ mod non_unix {
                                                 {
                                                     Ok(res) => {
                                                         st.invalidate().await;
-                                                        DaemonResponse::Action(res)
+                                                        DaemonResponse::Action { result: res }
                                                     }
                                                     Err(e) => DaemonResponse::Error {
                                                         message: e.to_string(),
@@ -374,7 +378,7 @@ mod non_unix {
                                     match st.provider.press_key(&combo).await {
                                         Ok(res) => {
                                             st.invalidate().await;
-                                            DaemonResponse::Action(res)
+                                            DaemonResponse::Action { result: res }
                                         }
                                         Err(e) => DaemonResponse::Error {
                                             message: e.to_string(),
@@ -384,7 +388,7 @@ mod non_unix {
                             }
                             Ok(DaemonRequest::CaptureScreenshot { bounds }) => {
                                 match st.provider.capture_screenshot(bounds).await {
-                                    Ok(shot) => DaemonResponse::Screenshot(shot),
+                                    Ok(shot) => DaemonResponse::Screenshot { screenshot: shot },
                                     Err(e) => DaemonResponse::Error {
                                         message: e.to_string(),
                                     },
